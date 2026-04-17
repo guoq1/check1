@@ -1,0 +1,16 @@
+{
+  "name": "auto-checkin",
+  "version": "1.0.0",
+  "description": "自动签到脚本，用于GitHub Actions定时执行",
+  "main": "checkin.js",
+  "scripts": {
+    "checkin": "node checkin.js"
+  },
+  "dependencies": {
+    "puppeteer": "^20.0.0",
+    "winston": "^3.8.2",
+    "dotenv": "^16.0.3"
+  },
+  "author": "",
+  "license": "MIT"
+}

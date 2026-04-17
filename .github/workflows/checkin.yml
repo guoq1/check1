@@ -36,10 +36,7 @@ jobs:
           node-version: '20'
 
       - name: Get dependencies
-        run: npm ci
-
-      - name: Install Chromium for Playwright
-        run: npx playwright install --with-deps chromium
+        run: npm install
 
       - name: Run checkin script
         env:
