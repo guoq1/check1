@@ -104,12 +104,20 @@ async function autoCheckin() {
       
       let loginButtonFound = false;
       for (const selector of loginButtonSelectors) {
+        console.log(`尝试选择器: ${selector}`);
         const button = page.locator(selector);
-        if (await button.count() > 0) {
+        const count = await button.count();
+        console.log(`找到 ${count} 个元素`);
+        if (count > 0) {
           console.log(`✅ 找到登录按钮: ${selector}`);
-          await button.click();
-          loginButtonFound = true;
-          break;
+          try {
+            await button.click({ timeout: 5000 });
+            loginButtonFound = true;
+            break;
+          } catch (error) {
+            console.error(`点击按钮失败: ${error.message}`);
+            continue;
+          }
         }
       }
       
@@ -117,11 +125,22 @@ async function autoCheckin() {
         console.error('⚠️ 未找到登录按钮，尝试点击页面中所有按钮');
         // 尝试点击所有按钮，看是否有登录功能
         const allButtons = await page.locator('button').all();
+        console.log(`找到 ${allButtons.length} 个按钮`);
         for (let i = 0; i < allButtons.length; i++) {
           const button = allButtons[i];
-          const text = await button.textContent();
-          console.log(`尝试点击按钮: ${text || `按钮${i+1}`}`);
-          await button.click();
+          let text = '';
+          try {
+            text = await button.textContent();
+          } catch (error) {
+            text = `按钮${i+1}`;
+          }
+          console.log(`尝试点击按钮: ${text}`);
+          try {
+            await button.click({ timeout: 3000 });
+          } catch (error) {
+            console.error(`点击按钮失败: ${error.message}`);
+            continue;
+          }
           await page.waitForTimeout(1000);
           // 检查是否登录成功
           const hasCheckinBtn = await page.locator('button:has-text("签到续期")').count() > 0;
