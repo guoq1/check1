@@ -34,9 +34,21 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: '20'
+          cache: 'npm'
+
+      - name: Cache Playwright browsers
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-chromium-${{ hashFiles('package.json') }}
+          restore-keys: |
+            playwright-${{ runner.os }}-chromium-
 
       - name: Get dependencies
         run: npm install
+
+      - name: Install Playwright dependencies
+        run: npx playwright install-deps chromium || true
 
       - name: Run checkin script
         env:
@@ -51,9 +63,8 @@ jobs:
         with:
           name: checkin-results-${{ github.run_number }}
           path: |
-            checkin.log
-            checkin_result.png
-            error_screenshot.png
+            *.log
+            *.png
           retention-days: 7
 
       - name: Show result
