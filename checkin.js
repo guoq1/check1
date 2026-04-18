@@ -73,21 +73,72 @@ async function autoCheckin() {
       const passwordInputs = await page.locator('input[type="password"]').all();
       
       if (passwordInputs.length === 0) {
-        throw new Error('无法找到密码输入框');
+        console.error('⚠️ 未找到密码输入框，尝试使用其他选择器');
+        // 尝试其他可能的密码输入框选择器
+        const otherInputs = await page.locator('input[type="text"], input[placeholder*="API"], input[placeholder*="key"]').all();
+        if (otherInputs.length === 0) {
+          throw new Error('无法找到密码输入框');
+        }
+        // 使用最后一个输入框
+        const targetInput = otherInputs[otherInputs.length - 1];
+        await targetInput.fill(CHECKIN_KEY);
+        console.log('✅ 成功输入密钥（使用备用选择器）');
+      } else {
+        // 使用最后一个密码输入框（通常是右侧的）
+        const targetInput = passwordInputs[passwordInputs.length - 1];
+        await targetInput.fill(CHECKIN_KEY);
+        console.log('✅ 成功输入密钥');
       }
-      
-      // 使用最后一个密码输入框（通常是右侧的）
-      const targetInput = passwordInputs[passwordInputs.length - 1];
-      await targetInput.fill(CHECKIN_KEY);
-      console.log('✅ 成功输入密钥');
       
       // 截图记录输入后状态
       await page.screenshot({ path: '2_after_input.png', fullPage: true });
       
-      // 点击登录按钮
-      const loginButton = page.locator('button:has-text("登录")');
-      await loginButton.click();
-      console.log('🖱️ 点击登录按钮');
+      // 点击登录按钮 - 尝试多种选择器
+      console.log('🖱️ 寻找登录按钮...');
+      const loginButtonSelectors = [
+        'button:has-text("登录")',
+        'button[type="submit"]',
+        'button:has-text("确认")',
+        'button:has-text("提交")'
+      ];
+      
+      let loginButtonFound = false;
+      for (const selector of loginButtonSelectors) {
+        const button = page.locator(selector);
+        if (await button.count() > 0) {
+          console.log(`✅ 找到登录按钮: ${selector}`);
+          await button.click();
+          loginButtonFound = true;
+          break;
+        }
+      }
+      
+      if (!loginButtonFound) {
+        console.error('⚠️ 未找到登录按钮，尝试点击页面中所有按钮');
+        // 尝试点击所有按钮，看是否有登录功能
+        const allButtons = await page.locator('button').all();
+        for (let i = 0; i < allButtons.length; i++) {
+          const button = allButtons[i];
+          const text = await button.textContent();
+          console.log(`尝试点击按钮: ${text || `按钮${i+1}`}`);
+          await button.click();
+          await page.waitForTimeout(1000);
+          // 检查是否登录成功
+          const hasCheckinBtn = await page.locator('button:has-text("签到续期")').count() > 0;
+          const hasSignedBtn = await page.locator('button:has-text("今日已签到")').count() > 0;
+          if (hasCheckinBtn || hasSignedBtn) {
+            console.log('✅ 登录成功！');
+            loginButtonFound = true;
+            break;
+          }
+        }
+      }
+      
+      if (!loginButtonFound) {
+        throw new Error('无法找到登录按钮');
+      }
+      
+      console.log('🖱️ 点击登录按钮完成');
       
       // 等待登录完成
       await page.waitForTimeout(3000);
