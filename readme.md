@@ -1,6 +1,6 @@
 # 自动签到脚本
 
-这是一个基于GitHub Actions的自动签到脚本，用于定时访问指定网站并完成签到操作。
+这是一个基于GitHub Actions的自动签到脚本，用于定时访问[某token网站](https://gpt.qt.cool/checkin)并完成签到操作。
 
 ## 功能特点
 
