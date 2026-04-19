@@ -291,8 +291,8 @@ async function autoCheckin() {
     console.log('🔍 检查签到成功状态...');
     
     // 1. 检查页面是否有"今日已签到"按钮
-    const hasSignedButton = await page.locator('button:has-text("今日已签到")').count() > 0;
-    if (hasSignedButton) {
+    const hasSignedButtonFinal = await page.locator('button:has-text("今日已签到")').count() > 0;
+    if (hasSignedButtonFinal) {
       console.log('🎉 检测到"今日已签到"按钮，签到成功！');
       return true;
     }
