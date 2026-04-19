@@ -255,7 +255,8 @@ async function autoCheckin() {
     }
     
     // 等待验证码或结果出现
-    await page.waitForTimeout(3000);
+    console.log('⏳ 等待验证码或结果出现...');
+    await page.waitForTimeout(5000);
     
     // 截图查看是否出现验证码
     await page.screenshot({ path: '4_after_click.png', fullPage: true });
@@ -267,20 +268,38 @@ async function autoCheckin() {
     if (hasSliderCaptcha) {
       console.log('🔐 检测到滑动验证码，开始处理...');
       await handleSliderCaptcha(page);
+      // 处理完验证码后再等待结果
+      console.log('⏳ 等待验证码处理结果...');
+      await page.waitForTimeout(5000);
     } else {
       console.log('ℹ️ 未检测到滑动验证码');
+      // 等待签到结果
+      console.log('⏳ 等待签到结果...');
+      await page.waitForTimeout(5000);
+      
+      // 刷新页面以确保状态更新
+      console.log('🔄 刷新页面以更新签到状态...');
+      await page.reload({ waitUntil: 'domcontentloaded' });
+      await page.waitForTimeout(3000);
     }
-    
-    // 等待签到结果
-    console.log('⏳ 等待签到结果...');
-    await page.waitForTimeout(5000);
     
     // 截图记录最终结果
     await page.screenshot({ path: '5_final_result.png', fullPage: true });
     console.log('📸 已保存最终结果截图: 5_final_result.png');
     
-    // 检查签到日历中今天是否有标记
+    // 检查签到成功状态
+    console.log('🔍 检查签到成功状态...');
+    
+    // 1. 检查页面是否有"今日已签到"按钮
+    const hasSignedButton = await page.locator('button:has-text("今日已签到")').count() > 0;
+    if (hasSignedButton) {
+      console.log('🎉 检测到"今日已签到"按钮，签到成功！');
+      return true;
+    }
+    
+    // 2. 检查签到日历中今天是否有标记
     const today = new Date().getDate();
+    console.log(`📅 检查今天(${today}号)是否有签到标记...`);
     const todayCell = await page.locator(`text="${today}"`).first();
     
     if (await todayCell.count() > 0) {
@@ -291,14 +310,28 @@ async function autoCheckin() {
       if (hasSignMark) {
         console.log(`🎉 签到成功！${today}号已有签到标记`);
         return true;
+      } else {
+        console.log(`ℹ️ ${today}号未发现签到标记`);
       }
+    } else {
+      console.log(`ℹ️ 未找到日期${today}的日历单元格`);
     }
     
-    // 检查页面是否有成功提示
+    // 3. 检查页面是否有成功提示
     const pageContent = await page.content();
     if (pageContent.includes('签到成功') || pageContent.includes('今日已签到')) {
       console.log('🎉 检测到签到成功提示');
       return true;
+    }
+    
+    // 4. 检查按钮文本是否变为"今日已签到"
+    const checkinButton = page.locator('button#checkinBtn.ci-btn.renew');
+    if (await checkinButton.count() > 0) {
+      const buttonText = await checkinButton.textContent();
+      if (buttonText && (buttonText.includes('今日已签到') || buttonText.includes('已签到'))) {
+        console.log(`🎉 检测到按钮状态变为: ${buttonText}`);
+        return true;
+      }
     }
     
     console.log('⚠️ 未检测到明确的签到成功标志');
