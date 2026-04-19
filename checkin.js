@@ -207,26 +207,47 @@ async function autoCheckin() {
     // 点击"签到"或"签到续期"按钮 - 优先使用精确选择器
     console.log('🖱️ 寻找并点击签到按钮...');
     
-    // 尝试精确选择器
+    // 尝试精确选择器 - 使用JavaScript执行点击
     const exactCheckinButton = page.locator('button#checkinBtn.ci-btn.renew');
     if (await exactCheckinButton.count() > 0) {
       console.log('✅ 找到精确的签到按钮');
-      await exactCheckinButton.click({ force: true });
-      console.log('🖱️ 点击签到按钮');
+      await page.evaluate(() => {
+        const button = document.querySelector('button#checkinBtn.ci-btn.renew');
+        if (button) {
+          button.click();
+        }
+      });
+      console.log('🖱️ 点击签到按钮（JavaScript执行）');
     } else {
-      // 尝试"签到续期"按钮
+      // 尝试"签到续期"按钮 - 使用JavaScript执行点击
       const renewCheckinButton = page.locator('button:has-text("签到续期")');
       if (await renewCheckinButton.count() > 0) {
         console.log('✅ 找到签到续期按钮');
-        await renewCheckinButton.click({ force: true });
-        console.log('🖱️ 点击签到续期按钮');
+        await page.evaluate(() => {
+          const buttons = document.querySelectorAll('button');
+          for (const btn of buttons) {
+            if (btn.textContent && btn.textContent.includes('签到续期')) {
+              btn.click();
+              break;
+            }
+          }
+        });
+        console.log('🖱️ 点击签到续期按钮（JavaScript执行）');
       } else {
-        // 尝试"签到"按钮
+        // 尝试"签到"按钮 - 使用JavaScript执行点击
         const checkinButton = page.locator('button:has-text("签到")');
         if (await checkinButton.count() > 0) {
           console.log('✅ 找到签到按钮');
-          await checkinButton.click({ force: true });
-          console.log('🖱️ 点击签到按钮');
+          await page.evaluate(() => {
+            const buttons = document.querySelectorAll('button');
+            for (const btn of buttons) {
+              if (btn.textContent && btn.textContent.includes('签到')) {
+                btn.click();
+                break;
+              }
+            }
+          });
+          console.log('🖱️ 点击签到按钮（JavaScript执行）');
         } else {
           throw new Error('未找到签到按钮');
         }
