@@ -65,7 +65,7 @@ async function waitAndHandleCaptchaWithRetry(page) {
 
     console.log(`🔐 第${attempt}轮检测到滑动验证码，开始处理...`);
     await handleSliderCaptcha(page);
-,
+
     // 给页面时间完成校验回调
     await page.waitForTimeout(2500);
 
