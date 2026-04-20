@@ -393,28 +393,26 @@ async function autoCheckin() {
     console.log(`📅 检查今天(${today}号)是否有签到标记...`);
     const todayCell = await page.locator(`text="${today}"`).first();
     
-    if (await todayCell.count() === 0) {
-      console.log(`❌ 未找到日期${today}的日历单元格，判定签到失败`);
-      throw new Error(`未找到日期${today}的日历单元格`);
+    if (await todayCell.count() > 0) {
+      // 检查父元素是否有签到标记
+      const parent = await todayCell.locator('..');
+      const hasSignMark = await parent.locator('.dot, .checked, [class*="sign"]').count() > 0;
+      
+      if (hasSignMark) {
+        console.log(`🎉 签到成功！${today}号已有签到标记`);
+        return true;
+      } else {
+        console.log(`ℹ️ ${today}号未发现签到标记，继续检查其他标志`);
+      }
+    } else {
+      console.log(`ℹ️ 未找到日期${today}的日历单元格，继续检查其他标志`);
     }
-    
-    // 检查父元素是否有签到标记
-    const parent = await todayCell.locator('..');
-    const hasSignMark = await parent.locator('.dot, .checked, [class*="sign"]').count() > 0;
-    
-    if (!hasSignMark) {
-      console.log(`❌ ${today}号未发现签到标记，判定签到失败`);
-      throw new Error(`${today}号未发现签到标记`);
-    }
-    
-    console.log(`🎉 签到成功！${today}号已有签到标记`);
     
     // 3. 辅助检查页面是否有成功提示
     const pageContent = await page.content();
     if (pageContent.includes('签到成功') || pageContent.includes('今日已签到')) {
       console.log('🎉 检测到签到成功提示');
-    } else {
-      console.log('ℹ️ 未检测到明确的签到成功提示，但日历标记已确认');
+      return true;
     }
     
     // 4. 辅助检查按钮文本是否变为"今日已签到"
@@ -422,11 +420,13 @@ async function autoCheckin() {
     if (await checkinButton.count() > 0) {
       const buttonText = await checkinButton.textContent();
       if (buttonText && (buttonText.includes('今日已签到') || buttonText.includes('已签到'))) {
-        console.log(`🎉 检测到按钮状态变为: ${buttonText}`);
+        console.log(`🎉 检测到按钮状态变为：${buttonText}`);
+        return true;
       }
     }
     
-    return true;
+    console.log('⚠️ 未检测到明确的签到成功标志');
+    return false;
     
   } catch (error) {
     console.error(`❌ 签到过程中发生错误: ${error.message}`);
