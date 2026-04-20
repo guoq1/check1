@@ -258,8 +258,8 @@ async function autoCheckin() {
     
     // 启动浏览器
     browser = await chromium.launch({
-      headless: false,  // 使用有头模式以便观察
-      args: ['--no-sandbox', '--disable-setuid-sandbox', '--start-maximized']
+      headless: true,
+      args: ['--no-sandbox', '--disable-setuid-sandbox']
     });
     
     const context = await browser.newContext({
