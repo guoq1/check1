@@ -1,6 +1,6 @@
 /**
  * 自动签到脚本 - Playwright 版本
- * 用于GitHub Actions定时执行，自动访问指定网站完成签到操作
+ * 用于 GitHub Actions 定时执行，自动访问指定网站完成签到操作
  */
 
 require('dotenv').config();
@@ -11,11 +11,11 @@ const path = require('path');
 // 获取密钥
 const CHECKIN_KEY = process.env.CHECKIN_KEY;
 if (!CHECKIN_KEY) {
-  console.error('❌ 未设置CHECKIN_KEY环境变量');
+  console.error('❌ 未设置 CHECKIN_KEY 环境变量');
   process.exit(1);
 }
 
-// 签到网站URL
+// 签到网站 URL
 const CHECKIN_URL = 'https://gpt.qt.cool/checkin';
 
 // 截图输出目录（便于 Actions 归档和定位）
@@ -27,27 +27,23 @@ const SCREENSHOT_DIR = process.env.SCREENSHOT_DIR || 'artifacts';
  * @returns {Promise<boolean>}
  */
 async function detectSliderCaptcha(page) {
-  const selectors = [
-    '.captcha-slider',
-    '.slider-captcha',
-    '[class*="slider"][class*="captcha"]',
-    '[class*="captcha"][class*="slider"]',
-    '.geetest',
-    '.nc-container'
-  ];
-
-  for (const selector of selectors) {
-    if (await page.locator(selector).count() > 0) {
-      return true;
-    }
+  // 尝试通过页面文本检测
+  const pageText = await page.innerText('body').catch(() => '');
+  if (pageText.includes('请完成滑块验证') || 
+      pageText.includes('请先完成滑块验证') || 
+      pageText.includes('请完成人机验证') || 
+      pageText.includes('按住滑块向右拖动')) {
+    console.log('✅ 通过页面文本检测到验证码');
+    return true;
   }
+  
   return false;
 }
 
 /**
  * 等待并处理验证码（支持多次检测与重试）
  * @param {import('playwright').Page} page
- * @returns {Promise<void>}
+ * @returns {Promise<boolean>} 返回是否验证成功
  */
 async function waitAndHandleCaptchaWithRetry(page) {
   const maxAttempts = 3;
@@ -64,21 +60,45 @@ async function waitAndHandleCaptchaWithRetry(page) {
     }
 
     console.log(`🔐 第${attempt}轮检测到滑动验证码，开始处理...`);
-    await handleSliderCaptcha(page);
+    const captchaSuccess = await handleSliderCaptcha(page);
+
+    if (captchaSuccess) {
+      console.log('✅ 验证码验证成功');
+      return true;
+    }
 
     // 给页面时间完成校验回调
     await page.waitForTimeout(2500);
 
+    // 检查是否还需要验证
     const stillHasCaptcha = await detectSliderCaptcha(page);
     if (!stillHasCaptcha) {
       console.log('✅ 验证码已消失，疑似验证通过');
-      return;
+      return true;
+    }
+
+    // 如果验证失败，页面会显示"请完成人机验证"，需要重新点击签到续期按钮触发验证码
+    console.log('🔄 验证失败，重新点击签到续期按钮触发验证码...');
+    await page.waitForTimeout(1000);
+    
+    // 重新点击签到按钮
+    const exactCheckinButton = page.locator('button#checkinBtn.ci-btn.renew');
+    if (await exactCheckinButton.count() > 0) {
+      await page.evaluate(() => {
+        const button = document.querySelector('button#checkinBtn.ci-btn.renew');
+        if (button) {
+          button.click();
+        }
+      });
+      console.log('🖱️ 重新点击签到按钮（JavaScript 执行）');
+      await page.waitForTimeout(1000);
     }
 
     console.log(`⚠️ 第${attempt}轮处理后验证码仍存在，准备重试`);
   }
 
-  console.log('⚠️ 多轮检测后仍未稳定通过验证码，继续后续结果校验流程');
+  console.log('❌ 多轮检测后仍未通过验证码');
+  return false;
 }
 
 /**
@@ -236,7 +256,7 @@ async function tryLoginWithRetry(page) {
 
     const expiredHint = await hasSessionExpiredHint(page);
     if (expiredHint) {
-      console.log('⚠️ 检测到“未登录/会话已过期”提示，准备重试登录');
+      console.log('⚠️ 检测到"未登录/会话已过期"提示，准备重试登录');
       continue;
     }
 
@@ -248,6 +268,124 @@ async function tryLoginWithRetry(page) {
 }
 
 /**
+ * 处理滑动验证码 - 自定义拼图验证码
+ * @param {import('playwright').Page} page - Playwright 页面实例
+ * @returns {Promise<boolean>} 返回是否验证成功
+ */
+async function handleSliderCaptcha(page) {
+  try {
+    console.log('🔍 查找拼图滑动验证码...');
+    
+    // 等待验证码弹窗加载
+    console.log('⏳ 等待验证码弹窗加载（3秒）...');
+    await page.waitForTimeout(3000);
+    
+    // 通过 Playwright 定位滑块：特征是文字 "›"，圆角 999px
+    let sliderHandle = null;
+    
+    // 方法1：使用 filter 找
+    const filtered = page.locator('div').filter({
+      hasText: /^›$/,
+      visible: true
+    });
+    if (await filtered.count() > 0) {
+      sliderHandle = filtered.first();
+      console.log('✅ 找到拼图滑块（filter方法）');
+    } else {
+      // 方法2：直接找所有div，通过text内容找
+      console.log('ℹ️ filter没找到，尝试直接查找...');
+      const allDivs = await page.locator('div').elementHandles();
+      for (const div of allDivs) {
+        const text = await div.textContent();
+        if (text && text.trim() === '›') {
+          const isVisible = await div.isVisible();
+          if (isVisible) {
+            sliderHandle = div;
+            console.log('✅ 找到拼图滑块（直接查找）');
+            break;
+          }
+        }
+      }
+    }
+    
+    if (!sliderHandle) {
+      console.log('❌ 未找到滑块');
+      return false;
+    }
+    
+    const isVisible = await sliderHandle.isVisible().catch(() => false);
+    if (!isVisible) {
+      console.log('❌ 滑块不可见');
+      return;
+    }
+    
+    console.log('✅ 找到拼图滑块');
+    console.log('🖱️ 开始拖动滑块...');
+    
+    // 获取滑块位置
+    const handleBox = await sliderHandle.boundingBox();
+    if (!handleBox) {
+      console.log('❌ 无法获取滑块位置');
+      return false;
+    }
+    
+    // 根据截图精准调整：
+    // - 滑块条总宽度约 420px，滑块直径约 40px，起点左侧留白约 10px
+    // - 拼图缺口从截图看在 38% - 48% 位置
+    // - 缺口距离起点大约 120px - 170px，更精准范围
+    // - 用户反馈之前一直超了，所以范围更小一点
+    const slideDistance = 120 + Math.floor(Math.random() * 50);
+    
+    // 起始坐标（滑块中心）
+    const startX = handleBox.x + handleBox.width / 2;
+    const startY = handleBox.y + handleBox.height / 2;
+    const endX = startX + slideDistance;
+    
+    console.log(`📏 拖动距离: ${slideDistance}px，从 (${startX.toFixed(0)}, ${startY.toFixed(0)}) 到 (${endX.toFixed(0)}, ${startY.toFixed(0)})`);
+    
+    // 使用鼠标操作，模拟人类拖动：分阶段移动 + 随机抖动 + 随机延迟
+    await page.mouse.move(startX, startY);
+    await page.waitForTimeout(50 + Math.random() * 100);
+    await page.mouse.down();
+    await page.waitForTimeout(50 + Math.random() * 50);
+    
+    // 分多步移动，模拟人类行为
+    const steps = 6 + Math.floor(Math.random() * 4);
+    for (let i = 1; i <= steps; i++) {
+      const currentX = startX + (slideDistance * (i / steps));
+      const jitter = (Math.random() - 0.5) * 3;
+      await page.mouse.move(currentX, startY + jitter, { steps: 15 });
+      await page.waitForTimeout(40 + Math.random() * 60);
+    }
+    
+    // 最后到位，稍微停留再松开
+    const finalJitter = (Math.random() - 0.5) * 2;
+    await page.mouse.move(endX, startY + finalJitter);
+    await page.waitForTimeout(100 + Math.random() * 100);
+    await page.mouse.up();
+    
+    console.log('✅ 滑块拖动完成，等待验证结果...');
+    
+    // 等待验证结果 - 需要更长时间让服务器验证和页面更新
+    await page.waitForTimeout(5000);
+    
+    // 检查验证码是否还存在
+    const stillHasCaptcha = await detectSliderCaptcha(page);
+    if (stillHasCaptcha) {
+      console.log('❌ 验证码仍然存在，验证失败');
+      return false;
+    }
+    
+    console.log('✅ 验证码已消失，验证成功');
+    return true;
+    
+  } catch (error) {
+    console.error(`❌ 处理滑动验证码时发生错误：${error.message}`);
+    return false;
+  }
+}
+
+/**
  * 主签到函数
  */
 async function autoCheckin() {
@@ -256,7 +394,7 @@ async function autoCheckin() {
   try {
     console.log('🚀 开始执行自动签到脚本');
     
-    // 启动浏览器
+    // 启动浏览器 - 无头模式用于 GitHub Actions 定时执行
     browser = await chromium.launch({
       headless: true,
       args: ['--no-sandbox', '--disable-setuid-sandbox']
@@ -324,7 +462,7 @@ async function autoCheckin() {
     // 点击"签到"或"签到续期"按钮 - 优先使用精确选择器
     console.log('🖱️ 寻找并点击签到按钮...');
     
-    // 尝试精确选择器 - 使用JavaScript执行点击
+    // 尝试精确选择器 - 使用 JavaScript 执行点击
     const exactCheckinButton = page.locator('button#checkinBtn.ci-btn.renew');
     if (await exactCheckinButton.count() > 0) {
       console.log('✅ 找到精确的签到按钮');
@@ -334,9 +472,9 @@ async function autoCheckin() {
           button.click();
         }
       });
-      console.log('🖱️ 点击签到按钮（JavaScript执行）');
+      console.log('🖱️ 点击签到按钮（JavaScript 执行）');
     } else {
-      // 尝试"签到续期"按钮 - 使用JavaScript执行点击
+      // 尝试"签到续期"按钮 - 使用 JavaScript 执行点击
       const renewCheckinButton = page.locator('button:has-text("签到续期")');
       if (await renewCheckinButton.count() > 0) {
         console.log('✅ 找到签到续期按钮');
@@ -349,9 +487,9 @@ async function autoCheckin() {
             }
           }
         });
-        console.log('🖱️ 点击签到续期按钮（JavaScript执行）');
+        console.log('🖱️ 点击签到续期按钮（JavaScript 执行）');
       } else {
-        // 尝试"签到"按钮 - 使用JavaScript执行点击
+        // 尝试"签到"按钮 - 使用 JavaScript 执行点击
         const checkinButton = page.locator('button:has-text("签到")');
         if (await checkinButton.count() > 0) {
           console.log('✅ 找到签到按钮');
@@ -364,7 +502,7 @@ async function autoCheckin() {
               }
             }
           });
-          console.log('🖱️ 点击签到按钮（JavaScript执行）');
+          console.log('️ 点击签到按钮（JavaScript 执行）');
         } else {
           throw new Error('未找到签到按钮');
         }
@@ -372,7 +510,11 @@ async function autoCheckin() {
     }
     
     // 等待并尝试处理验证码（多轮检测 + 重试）
-    await waitAndHandleCaptchaWithRetry(page);
+    const captchaPassed = await waitAndHandleCaptchaWithRetry(page);
+    
+    if (!captchaPassed) {
+      throw new Error('验证码验证失败，无法继续签到');
+    }
 
     // 截图查看点击后的状态（含验证码处理结果）
     const afterClickScreenshotPath = path.join(SCREENSHOT_DIR, '4_after_click.png');
@@ -495,85 +637,10 @@ async function autoCheckin() {
   }
 }
 
-/**
- * 处理滑动验证码
- * @param {Page} page - Playwright页面实例
- */
-async function handleSliderCaptcha(page) {
-  try {
-    console.log('🔍 查找验证码元素...');
-    
-    // 等待验证码元素出现
-    const captchaSelectors = [
-      '.captcha-slider',
-      '.slider-captcha',
-      '[class*="slider"]'
-    ];
-    
-    let captchaElement = null;
-    
-    for (const selector of captchaSelectors) {
-      const element = page.locator(selector).first();
-      if (await element.count() > 0) {
-        captchaElement = element;
-        console.log(`✅ 找到验证码元素: ${selector}`);
-        break;
-      }
-    }
-    
-    if (!captchaElement) {
-      console.log('⚠️ 未找到验证码元素，可能不需要处理');
-      return;
-    }
-    
-    // 查找滑块
-    const sliderHandle = captchaElement.locator('.slider-handle, .handle, [class*="handle"]').first();
-    
-    if (await sliderHandle.count() === 0) {
-      console.log('⚠️ 未找到滑块元素');
-      return;
-    }
-    
-    console.log('🖱️ 开始拖动滑块...');
-    
-    // 获取滑块位置
-    const handleBox = await sliderHandle.boundingBox();
-    
-    if (!handleBox) {
-      throw new Error('无法获取滑块位置');
-    }
-    
-    // 获取验证码容器位置
-    const captchaBox = await captchaElement.boundingBox();
-    
-    if (!captchaBox) {
-      throw new Error('无法获取验证码容器位置');
-    }
-    
-    // 计算滑动距离（滑到最右边）
-    const slideDistance = captchaBox.width - handleBox.width - 10;
-    
-    // 拖动滑块
-    await sliderHandle.dragTo(sliderHandle, {
-      force: true,
-      targetPosition: { x: slideDistance, y: 0 }
-    });
-    
-    console.log('✅ 滑块拖动完成');
-    
-    // 等待验证结果
-    await page.waitForTimeout(3000);
-    
-  } catch (error) {
-    console.error(`❌ 处理滑动验证码时发生错误: ${error.message}`);
-    // 不抛出错误，继续执行
-  }
-}
-
 // 执行签到
 (async () => {
   try {
-    console.log('========== 🚀 开始签到测试（Playwright版本） ==========');
+    console.log('========== 🚀 开始签到测试（Playwright 版本） ==========');
     const success = await autoCheckin();
     
     if (success) {
