@@ -8,7 +8,15 @@ const { chromium } = require('playwright');
 const fs = require('fs');
 const path = require('path');
 const DdddOcr = require('ddddocr').default;
-const ocr = new DdddOcr();
+const Jimp = require('jimp');
+
+let ocrInstance = null;
+async function getOcr() {
+  if (!ocrInstance) {
+    ocrInstance = await DdddOcr.create();
+  }
+  return ocrInstance;
+}
 
 // 获取密钥
 const CHECKIN_KEY = process.env.CHECKIN_KEY;
@@ -270,8 +278,93 @@ async function tryLoginWithRetry(page) {
 }
 
 /**
+ * 检测拼图缺口位置
+ * 使用 Jimp 分析像素差异找到缺口
+ * @param {Buffer} screenshot - 验证码截图缓冲区
+ * @param {number} sliderWidth - 滑块宽度
+ * @returns {Promise<number>} 缺口X坐标（相对于图片）
+ */
+async function detectGap(screenshot, sliderWidth) {
+  const image = await Jimp.read(screenshot);
+  const width = image.bitmap.width;
+  const height = image.bitmap.height;
+  
+  console.log(`📊 图像尺寸: ${width}x${height}，开始分析像素差异...`);
+  
+  const diffSums = new Array(width).fill(0);
+  
+  image.scan(0, 0, width, height, function(x, y, idx) {
+    const gray = (this.bitmap.data[idx] + this.bitmap.data[idx + 1] + this.bitmap.data[idx + 2]) / 3;
+    
+    if (x > 0) {
+      const prevGray = (this.bitmap.data[idx - 4] + this.bitmap.data[idx - 3] + this.bitmap.data[idx - 2]) / 3;
+      diffSums[x] += Math.abs(gray - prevGray);
+    }
+  });
+  
+  let maxDiff = 0;
+  let gapX = Math.floor(width / 3);
+  const minX = 50;
+  const maxX = width - sliderWidth - 10;
+  
+  for (let x = minX; x < maxX; x++) {
+    if (diffSums[x] > maxDiff) {
+      maxDiff = diffSums[x];
+      gapX = x;
+    }
+  }
+  
+  console.log(`🎯 检测到缺口位置: X = ${gapX}px (最大差异值: ${maxDiff.toFixed(0)})`);
+  
+  const adjustedGapX = gapX - 2;
+  
+  return adjustedGapX;
+}
+
+/**
+ * 生成拟人化滑动轨迹
+ * @param {number} distance - 总滑动距离
+ * @returns {Array<{x: number, y: number, delay: number}>}
+ */
+function generateHumanTrack(distance) {
+  const tracks = [];
+  let current = 0;
+  const mid = distance * 0.7;
+  
+  while (current < distance) {
+    let step;
+    if (current < mid) {
+      step = 3 + Math.random() * 5;
+    } else {
+      step = 1 + Math.random() * 3;
+    }
+    
+    const yOffset = (Math.random() - 0.5) * 2;
+    const delay = 10 + Math.random() * 80;
+    
+    tracks.push({
+      x: Math.min(step, distance - current),
+      y: yOffset,
+      delay: delay
+    });
+    
+    current += step;
+  }
+  
+  if (current < distance) {
+    tracks.push({
+      x: distance - current,
+      y: (Math.random() - 0.5) * 2,
+      delay: 30
+    });
+  }
+  
+  return tracks;
+}
+
+/**
  * 处理滑动验证码 - 自定义拼图验证码
- * 使用 ddddocr 自动识别缺口位置
+ * 使用 Jimp 像素差异检测自动识别缺口位置
  * @param {import('playwright').Page} page - Playwright 页面实例
  * @returns {Promise<boolean>} 返回是否验证成功
  */
@@ -279,14 +372,9 @@ async function handleSliderCaptcha(page) {
   try {
     console.log('🔍 查找拼图滑动验证码...');
     
-    // 等待验证码弹窗加载
-    console.log('⏳ 等待验证码弹窗加载（3秒）...');
     await page.waitForTimeout(3000);
     
-    // 通过 Playwright 定位滑块：特征是文字 "›"，圆角 999px
     let sliderHandle = null;
-    
-    // 方法1：使用 filter 找
     const filtered = page.locator('div').filter({
       hasText: /^›$/,
       visible: true
@@ -295,7 +383,6 @@ async function handleSliderCaptcha(page) {
       sliderHandle = filtered.first();
       console.log('✅ 找到拼图滑块（filter方法）');
     } else {
-      // 方法2：直接找所有div，通过text内容找
       console.log('ℹ️ filter没找到，尝试直接查找...');
       const allDivs = await page.locator('div').elementHandles();
       for (const div of allDivs) {
@@ -324,102 +411,92 @@ async function handleSliderCaptcha(page) {
     
     console.log('✅ 找到拼图滑块');
     
-    // 获取滑块和验证码容器位置
     const handleBox = await sliderHandle.boundingBox();
     if (!handleBox) {
       console.log('❌ 无法获取滑块位置');
       return false;
     }
     
-    let slideDistance = null;
+    let captchaContainer = sliderHandle.locator('..').locator('..');
+    const containerBox = await captchaContainer.boundingBox().catch(() => null);
     
-    // 尝试用 ddddocr 识别
-    try {
-      // 获取验证码容器（滑块的祖父元素，包含整个拼图图片）
-      let captchaContainer = sliderHandle.locator('..').locator('..');
-      const containerBox = await captchaContainer.boundingBox().catch(() => null);
-      
-      if (containerBox) {
-        // 截验证码图
-        console.log('📸 截取验证码图片用于 ddddocr 识别...');
-        const screenshot = await page.screenshot({
-          clip: {
-            x: containerBox.x,
-            y: containerBox.y,
-            width: containerBox.width,
-            height: containerBox.height
-          }
-        });
-        
-        // 使用 ddddocr 识别缺口位置
-         console.log('🔍 ddddocr 识别滑块缺口位置...');
-         const result = ocr.detect(screenshot);
-         console.log(`🎯 识别结果：缺口X坐标 = ${result}px`);
-         
-         // 计算滑动距离：result 就是目标X坐标（相对于容器）
-         // 滑块起点X = 容器x + 滑块半径
-         slideDistance = result - handleBox.width / 2;
+    if (!containerBox) {
+      console.log('❌ 无法获取验证码容器位置');
+      const slideDistance = 100 + Math.floor(Math.random() * 100);
+      console.log(`🎲 使用随机距离：${slideDistance.toFixed(0)}px`);
+      return await performSlide(page, handleBox, slideDistance);
+    }
+    
+    console.log('📸 截取验证码图片用于缺口检测...');
+    const screenshot = await page.screenshot({
+      clip: {
+        x: containerBox.x,
+        y: containerBox.y,
+        width: containerBox.width,
+        height: containerBox.height
       }
-    } catch (ocrError) {
-      console.log(`⚠️ ddddocr 识别失败：${ocrError.message}，回退到随机范围...`);
-    }
+    });
     
-    // 如果 ddddocr 识别失败，回退到随机重试
-    if (slideDistance === null) {
-      // 拼图验证码每次缺口位置都随机变化
-      // 根据截图调整：缺口位置大约在 100px - 200px 范围
-      // 放宽范围，增加随机性，提高命中概率
-      slideDistance = 100 + Math.floor(Math.random() * 100);
-      console.log(`🎲 ddddocr 识别失败，使用随机距离：${slideDistance.toFixed(0)}px`);
-    }
+    const gapX = await detectGap(screenshot, handleBox.width);
+    const slideDistance = gapX - handleBox.width / 2;
     
-    // 起始坐标（滑块中心）
-    const startX = handleBox.x + handleBox.width / 2;
-    const startY = handleBox.y + handleBox.height / 2;
-    const endX = startX + slideDistance;
+    console.log(`📏 计算滑动距离: ${slideDistance.toFixed(0)}px`);
     
-    console.log(`📏 拖动距离: ${slideDistance.toFixed(0)}px，从 (${startX.toFixed(0)}, ${startY.toFixed(0)}) 到 (${endX.toFixed(0)}, ${startY.toFixed(0)})`);
-    
-    // 使用鼠标操作，模拟人类拖动：分阶段移动 + 随机抖动 + 随机延迟
-    await page.mouse.move(startX, startY);
-    await page.waitForTimeout(50 + Math.random() * 100);
-    await page.mouse.down();
-    await page.waitForTimeout(50 + Math.random() * 50);
-    
-    // 分多步移动，模拟人类行为 - 增加延迟让拖动更自然
-    const steps = 6 + Math.floor(Math.random() * 4);
-    for (let i = 1; i <= steps; i++) {
-      const currentX = startX + (slideDistance * (i / steps));
-      const jitter = (Math.random() - 0.5) * 3;
-      await page.mouse.move(currentX, startY + jitter, { steps: 15 });
-      await page.waitForTimeout(100 + Math.random() * 150);
-    }
-    
-    // 最后到位，稍微停留再松开
-    const finalJitter = (Math.random() - 0.5) * 2;
-    await page.mouse.move(endX, startY + finalJitter);
-    await page.waitForTimeout(300 + Math.random() * 200);
-    await page.mouse.up();
-    
-    console.log('✅ 滑块拖动完成，等待验证结果...');
-    
-    // 等待验证结果 - 需要更长时间让服务器验证和页面更新
-    await page.waitForTimeout(5000);
-    
-    // 检查验证码是否还存在
-    const stillHasCaptcha = await detectSliderCaptcha(page);
-    if (stillHasCaptcha) {
-      console.log('❌ 验证码仍然存在，验证失败');
-      return false;
-    }
-    
-    console.log('✅ 验证码已消失，验证成功');
-    return true;
+    return await performSlide(page, handleBox, slideDistance);
     
   } catch (error) {
     console.error(`❌ 处理滑动验证码时发生错误：${error.message}`);
     return false;
   }
+}
+
+/**
+ * 执行拟人化滑动操作
+ * @param {import('playwright').Page} page
+ * @param {any} handleBox
+ * @param {number} slideDistance
+ * @returns {Promise<boolean>}
+ */
+async function performSlide(page, handleBox, slideDistance) {
+  const startX = handleBox.x + handleBox.width / 2;
+  const startY = handleBox.y + handleBox.height / 2;
+  const endX = startX + slideDistance;
+  
+  console.log(`� 开始滑动：从 (${startX.toFixed(0)}, ${startY.toFixed(0)}) 到 (${endX.toFixed(0)}, ${startY.toFixed(0)})`);
+  
+  await page.mouse.move(startX, startY);
+  await page.waitForTimeout(50 + Math.random() * 100);
+  await page.mouse.down();
+  await page.waitForTimeout(50 + Math.random() * 50);
+  
+  const tracks = generateHumanTrack(slideDistance);
+  let currentX = startX;
+  let currentY = startY;
+  
+  for (const track of tracks) {
+    currentX += track.x;
+    currentY += track.y;
+    await page.mouse.move(currentX, currentY, { steps: 5 + Math.floor(Math.random() * 10) });
+    await page.waitForTimeout(track.delay);
+  }
+  
+  const finalJitter = (Math.random() - 0.5) * 2;
+  await page.mouse.move(endX, startY + finalJitter);
+  await page.waitForTimeout(300 + Math.random() * 200);
+  await page.mouse.up();
+  
+  console.log('✅ 滑块拖动完成，等待验证结果...');
+  
+  await page.waitForTimeout(5000);
+  
+  const stillHasCaptcha = await detectSliderCaptcha(page);
+  if (stillHasCaptcha) {
+    console.log('❌ 验证码仍然存在，验证失败');
+    return false;
+  }
+  
+  console.log('✅ 验证码已消失，验证成功');
+  return true;
 }
 
 /**
