@@ -329,12 +329,10 @@ async function handleSliderCaptcha(page) {
       return false;
     }
     
-    // 根据截图精准调整：
-    // - 滑块条总宽度约 420px，滑块直径约 40px，起点左侧留白约 10px
-    // - 拼图缺口从截图看在 38% - 48% 位置
-    // - 缺口距离起点大约 120px - 170px，更精准范围
-    // - 用户反馈之前一直超了，所以范围更小一点
-    const slideDistance = 120 + Math.floor(Math.random() * 50);
+    // 拼图验证码每次缺口位置都随机变化
+    // 根据截图调整：缺口位置大约在 100px - 200px 范围
+    // 放宽范围，增加随机性，提高命中概率
+    const slideDistance = 100 + Math.floor(Math.random() * 100);
     
     // 起始坐标（滑块中心）
     const startX = handleBox.x + handleBox.width / 2;
