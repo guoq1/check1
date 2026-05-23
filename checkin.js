@@ -37,14 +37,43 @@ const SCREENSHOT_DIR = process.env.SCREENSHOT_DIR || 'artifacts';
  * @returns {Promise<boolean>}
  */
 async function detectSliderCaptcha(page) {
-  // 尝试通过页面文本检测
   const pageText = await page.innerText('body').catch(() => '');
-  if (pageText.includes('请完成滑块验证') || 
-      pageText.includes('请先完成滑块验证') || 
-      pageText.includes('请完成人机验证') || 
-      pageText.includes('按住滑块向右拖动')) {
-    console.log('✅ 通过页面文本检测到验证码');
-    return true;
+  
+  const captchaTexts = [
+    '请完成滑块验证',
+    '请先完成滑块验证',
+    '请完成人机验证',
+    '按住滑块向右拖动',
+    '向右拖动完成验证',
+    '拖动滑块',
+    '滑动验证',
+    '滑块验证',
+    '安全验证',
+    '验证失败',
+    '验证超时'
+  ];
+  
+  for (const text of captchaTexts) {
+    if (pageText.includes(text)) {
+      console.log(`✅ 通过页面文本检测到验证码: "${text}"`);
+      return true;
+    }
+  }
+  
+  const sliderSelectors = [
+    'div[class*="slider"]',
+    '.captcha-slider',
+    '.geetest',
+    'div[style*="position: absolute"][style*="left"]',
+    '.verify-slider'
+  ];
+  
+  for (const selector of sliderSelectors) {
+    const el = page.locator(selector).filter({ visible: true });
+    if (await el.count() > 0) {
+      console.log(`✅ 通过元素选择器检测到验证码: ${selector}`);
+      return true;
+    }
   }
   
   return false;
@@ -184,27 +213,71 @@ async function isLoggedIn(page) {
 
   // 检查是否有绑定邮箱或退出登录按钮（最可靠的登录标志）
   if (pageText.includes('已绑定:') || pageText.includes('退出登录')) {
+    console.log('✅ 检测到"已绑定"或"退出登录"，确认已登录');
     return true;
   }
 
-  // 检查是否有密码输入框（未登录的标志）
-  const hasPasswordInput = await page.locator('input#renewKey[type="password"]').count() > 0;
+  // 检查是否有密码输入框且可见（未登录的标志）
+  const passwordInput = page.locator('input#renewKey[type="password"]');
+  const hasPasswordInput = await passwordInput.count() > 0;
   if (hasPasswordInput) {
-    // 如果有密码输入框，说明还没登录
-    return false;
+    const isVisible = await passwordInput.first().isVisible().catch(() => false);
+    if (isVisible) {
+      console.log('✅ 检测到可见的密码输入框，说明未登录');
+      return false;
+    } else {
+      console.log('ℹ️ 密码输入框存在但不可见，可能正在登录中');
+    }
   }
 
-  // 检查是否有登录按钮（未登录的标志）
-  const hasLoginButton = await page.locator('button:has-text("登录"), button:has-text("Login")').count() > 0;
+  // 检查是否有登录按钮且可见（未登录的标志）
+  const loginButton = page.locator('button:has-text("登录"), button:has-text("Login")');
+  const hasLoginButton = await loginButton.count() > 0;
   if (hasLoginButton) {
-    return false;
+    const isVisible = await loginButton.first().isVisible().catch(() => false);
+    if (isVisible) {
+      console.log('✅ 检测到可见的登录按钮，说明未登录');
+      return false;
+    }
   }
 
-  // 最后检查是否有签到按钮
+  // 检查是否有签到按钮
   const hasCheckinBtn = await page.locator('button:has-text("签到续期"), button:has-text("签到"), button#checkinBtn.ci-btn.renew').count() > 0;
-  const hasSignedBtn = await page.locator('button:has-text("今日已签到")').count() > 0;
+  if (hasCheckinBtn) {
+    console.log('✅ 检测到签到按钮，确认已登录');
+    return true;
+  }
 
-  return hasCheckinBtn || hasSignedBtn;
+  // 检查是否有今日已签到按钮
+  const hasSignedBtn = await page.locator('button:has-text("今日已签到")').count() > 0;
+  if (hasSignedBtn) {
+    console.log('✅ 检测到"今日已签到"按钮，确认已登录');
+    return true;
+  }
+
+  // 检查页面是否包含用户相关信息
+  const userInfoSelectors = [
+    '[class*="user"]',
+    '[class*="avatar"]',
+    '.profile',
+    '[data-user]'
+  ];
+  for (const selector of userInfoSelectors) {
+    const el = page.locator(selector).filter({ visible: true });
+    if (await el.count() > 0) {
+      console.log(`✅ 检测到用户元素 ${selector}，可能已登录`);
+      return true;
+    }
+  }
+
+  // 检查页面是否显示余额或使用次数等信息
+  if (pageText.includes('余额') || pageText.includes('使用次数') || pageText.includes('剩余')) {
+    console.log('✅ 检测到余额/使用次数信息，可能已登录');
+    return true;
+  }
+
+  console.log('ℹ️ 无法确定登录状态');
+  return false;
 }
 
 /**
@@ -218,10 +291,25 @@ async function tryLoginWithRetry(page) {
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     console.log(`🔄 第${attempt}/${maxAttempts}次尝试登录...`);
 
+    // 在每次尝试前检查是否已经登录
+    const alreadyLoggedIn = await isLoggedIn(page);
+    if (alreadyLoggedIn) {
+      console.log('✅ 检测到已处于登录状态，跳过本次尝试');
+      return true;
+    }
+
     // 强制使用指定输入框：<input class="ci-input" id="renewKey" ...>
     const exactInput = page.locator('input#renewKey.ci-input[type="password"]');
     if (await exactInput.count() === 0) {
       console.log('❌ 未找到指定的 API Key 输入框 #renewKey.ci-input');
+      continue;
+    }
+
+    // 检查输入框是否可见
+    const isVisible = await exactInput.first().isVisible().catch(() => false);
+    if (!isVisible) {
+      console.log('⚠️ 输入框不可见，尝试等待或刷新后重试');
+      await page.waitForTimeout(2000);
       continue;
     }
 
@@ -338,8 +426,8 @@ async function detectGap(screenshot, sliderWidth) {
   
   console.log(`🎯 检测到缺口位置: X = ${gapX}px (综合得分: ${maxScore.toFixed(0)})`);
   
-  const compensation = -sliderWidth * 0.5 + 2;
-  const adjustedGapX = gapX + compensation;
+  const compensation = sliderWidth * 0.3;
+  const adjustedGapX = gapX - compensation;
   
   const topCandidates = [];
   for (let x = minX; x < maxX; x++) {
@@ -349,6 +437,7 @@ async function detectGap(screenshot, sliderWidth) {
   }
   
   console.log(`🔍 找到 ${topCandidates.length} 个候选缺口位置`);
+  console.log(`📐 滑块宽度: ${sliderWidth}px, 补偿值: ${compensation.toFixed(1)}px, 调整后缺口位置: ${adjustedGapX.toFixed(1)}px`);
   
   return { gapX: adjustedGapX, confidence: maxScore };
 }
@@ -362,30 +451,47 @@ function generateHumanTrack(distance) {
   const tracks = [];
   let current = 0;
   
-  const phase1End = distance * 0.3;
-  const phase2End = distance * 0.8;
+  const totalTime = 800 + Math.random() * 400;
+  const baseDelay = totalTime / distance;
+  
+  const phase1End = distance * 0.25;
+  const phase2End = distance * 0.75;
+  
+  const noiseFactor = 0.3 + Math.random() * 0.2;
   
   while (current < distance) {
     let step;
     let delay;
     
-    if (current < phase1End) {
-      step = 5 + Math.random() * 8;
-      delay = 10 + Math.random() * 40;
-    } else if (current < phase2End) {
-      step = 3 + Math.random() * 4;
-      delay = 20 + Math.random() * 60;
+    const progress = current / distance;
+    
+    if (progress < 0.25) {
+      step = 4 + Math.random() * 10;
+      delay = baseDelay * (0.8 + Math.random() * 0.6);
+    } else if (progress < 0.75) {
+      step = 3 + Math.random() * 6;
+      delay = baseDelay * (1.0 + Math.random() * 0.8);
     } else {
-      step = 1 + Math.random() * 2;
-      delay = 40 + Math.random() * 100;
+      step = 1 + Math.random() * 3;
+      delay = baseDelay * (1.5 + Math.random() * 1.0);
     }
     
-    if (current > distance * 0.7 && Math.random() < 0.2) {
-      const backStep = -(0.5 + Math.random() * 1.5);
+    if (progress > 0.3 && progress < 0.7 && Math.random() < 0.05) {
+      const pauseDelay = 50 + Math.random() * 100;
+      tracks.push({ x: 0, y: 0, delay: pauseDelay });
+    }
+    
+    if (progress > 0.6 && Math.random() < 0.3) {
+      const backStep = -(0.3 + Math.random() * 2);
       step += backStep;
     }
     
-    const yOffset = (Math.random() - 0.5) * 3;
+    if (progress > 0.8 && Math.random() < 0.4) {
+      const microAdjust = (Math.random() - 0.5) * 1.5;
+      step += microAdjust;
+    }
+    
+    const yOffset = (Math.random() - 0.5) * (4 + noiseFactor * 3);
     
     const remaining = distance - current;
     if (Math.abs(step) > Math.abs(remaining)) {
@@ -396,28 +502,28 @@ function generateHumanTrack(distance) {
       tracks.push({
         x: step,
         y: yOffset,
-        delay: delay
+        delay: Math.max(5, delay + (Math.random() - 0.5) * 20)
       });
     }
     
     current += step;
   }
   
-  if (Math.abs(distance - current) > 0.1) {
+  if (Math.abs(distance - current) > 0.5) {
     tracks.push({
       x: distance - current,
-      y: (Math.random() - 0.5) * 2,
-      delay: 80 + Math.random() * 120
+      y: (Math.random() - 0.5) * 3,
+      delay: 50 + Math.random() * 100
     });
   }
   
-  if (Math.random() < 0.7) {
-    const finalAdjust = (Math.random() - 0.5) * 3;
-    if (Math.abs(finalAdjust) > 0.5) {
+  if (Math.random() < 0.8) {
+    const finalAdjust = (Math.random() - 0.5) * 4;
+    if (Math.abs(finalAdjust) > 0.3) {
       tracks.push({
         x: finalAdjust,
-        y: (Math.random() - 0.5) * 1,
-        delay: 100 + Math.random() * 150
+        y: (Math.random() - 0.5) * 1.5,
+        delay: 80 + Math.random() * 120
       });
     }
   }
@@ -552,16 +658,17 @@ async function handleSliderCaptcha(page) {
     
     const { gapX, confidence } = await detectGap(screenshot, handleBox.width);
     const handleXInContainer = handleBox.x - containerBox.x;
-    const containerLeftPadding = 8;
-    const slideDistance = Math.max(20, gapX - containerLeftPadding);
+    const containerLeftPadding = handleXInContainer > 0 ? handleXInContainer : 8;
+    const slideDistance = Math.max(30, Math.min(containerBox.width - handleBox.width - 20, gapX - containerLeftPadding + handleBox.width * 0.4));
     
-    console.log(`📏 计算滑动距离: 缺口X=${gapX}px, 左边距=${containerLeftPadding}px, 滑动距离=${slideDistance.toFixed(0)}px (置信度: ${confidence.toFixed(0)})`);
+    console.log(`📏 计算滑动距离: 缺口X=${gapX.toFixed(1)}px, 滑块在容器内位置=${handleXInContainer.toFixed(1)}px, 左边距=${containerLeftPadding.toFixed(1)}px, 滑动距离=${slideDistance.toFixed(1)}px (置信度: ${confidence.toFixed(0)})`);
     
-    if (confidence < 1000) {
-      console.log('⚠️ 置信度较低，添加随机扰动');
-      const perturbation = (Math.random() - 0.5) * 20;
-      const newDistance = slideDistance + perturbation;
-      console.log(`🎲 添加扰动后距离: ${newDistance.toFixed(0)}px`);
+    if (confidence < 1500) {
+      console.log('⚠️ 置信度较低，添加自适应扰动');
+      const perturbationScale = Math.min(1, (1500 - confidence) / 1000);
+      const perturbation = (Math.random() - 0.5) * 30 * perturbationScale;
+      const newDistance = Math.max(30, Math.min(containerBox.width - handleBox.width - 10, slideDistance + perturbation));
+      console.log(`🎲 置信度扰动系数: ${perturbationScale.toFixed(2)}, 添加扰动: ${perturbation.toFixed(1)}px, 调整后距离: ${newDistance.toFixed(1)}px`);
       return await performSlide(page, handleBox, newDistance);
     }
     
@@ -613,16 +720,34 @@ async function performSlide(page, handleBox, slideDistance) {
   
   console.log('✅ 滑块拖动完成，等待验证结果...');
   
-  await page.waitForTimeout(3000 + Math.random() * 2000);
+  await page.waitForTimeout(2000 + Math.random() * 2000);
   
-  const stillHasCaptcha = await detectSliderCaptcha(page);
-  if (stillHasCaptcha) {
-    console.log('❌ 验证码仍然存在，验证失败');
-    return false;
+  let stillHasCaptcha = await detectSliderCaptcha(page);
+  if (!stillHasCaptcha) {
+    console.log('✅ 验证码已消失，验证成功');
+    return true;
   }
   
-  console.log('✅ 验证码已消失，验证成功');
-  return true;
+  console.log('⏳ 验证码仍存在，等待动画完成...');
+  await page.waitForTimeout(3000 + Math.random() * 2000);
+  
+  stillHasCaptcha = await detectSliderCaptcha(page);
+  if (!stillHasCaptcha) {
+    console.log('✅ 验证码动画完成后消失，验证成功');
+    return true;
+  }
+  
+  console.log('⏳ 等待滑块归位...');
+  await page.waitForTimeout(2000 + Math.random() * 1000);
+  
+  stillHasCaptcha = await detectSliderCaptcha(page);
+  if (!stillHasCaptcha) {
+    console.log('✅ 滑块归位后验证码消失，验证成功');
+    return true;
+  }
+  
+  console.log('❌ 验证码仍然存在，验证失败');
+  return false;
 }
 
 /**
