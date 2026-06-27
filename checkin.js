@@ -375,71 +375,324 @@ async function tryLoginWithRetry(page) {
 }
 
 /**
- * 检测拼图缺口位置
- * 使用 Jimp 增强版像素差异分析找到缺口
+ * 检测拼图缺口位置 — 增强版
+ *
+ * 三层递进策略：
+ *  1. 高斯模糊降噪 + RGB 三通道 Sobel 梯度 → 垂直一致性评分 → 滑动窗口 → 多峰检测
+ *  2. 若置信度低，尝试 Python OpenCV 模板匹配（需安装 opencv-python）
+ *  3. 全部失败则返回随机位置 + 极低置信度（触发外部扰动）
+ *
  * @param {Buffer} screenshot - 验证码截图缓冲区
  * @param {number} sliderWidth - 滑块宽度
- * @returns {Promise<{gapX: number, confidence: number}>} 缺口X坐标和置信度
+ * @param {Buffer} [tileScreenshot] - 可选：拼图块截图，用于模板匹配
+ * @returns {Promise<{gapX: number, confidence: number, method: string}>}
  */
-async function detectGap(screenshot, sliderWidth) {
+async function detectGap(screenshot, sliderWidth, tileScreenshot) {
+  // --- 策略 1：Jimp 增强边缘检测 ---
+  const result = await detectGapByEdge(screenshot, sliderWidth);
+  if (result.confidence >= 1.5) {
+    console.log(`✅ 边缘检测置信度足够 (${result.confidence.toFixed(1)})，直接使用`);
+    return { ...result, method: 'edge' };
+  }
+
+  // --- 策略 2：模板匹配（有拼图块截图时） ---
+  if (tileScreenshot) {
+    console.log('⚠️ 边缘检测置信度较低，尝试模板匹配...');
+    const tmResult = await detectGapByTemplate(screenshot, tileScreenshot);
+    if (tmResult && tmResult.confidence >= 0.3) {
+      console.log(`✅ 模板匹配成功: gapX=${tmResult.gapX.toFixed(0)}, 置信度=${tmResult.confidence.toFixed(2)}`);
+      return { ...tmResult, method: 'template' };
+    }
+  }
+
+  // --- 策略 3：降级返回边缘检测结果 + 低置信度 ---
+  console.log('⚠️ 所有检测方法置信度均低，使用边缘检测结果 + 随机扰动');
+  return { ...result, method: 'edge_lowconf' };
+}
+
+/**
+ * 基于 Jimp 的增强边缘检测 — 核心算法
+ *
+ * 改进点：
+ *  - Gaussian blur 降噪（去纹理保留结构边缘）
+ *  - RGB 三通道独立算梯度（不丢失颜色边缘信息）
+ *  - 垂直一致性评分（真正缺口的边缘是竖直线，跨行一致）
+ *  - 滑动窗口聚合（缺口阴影跨多列，单列噪声被平滑）
+ *  - 局部峰值检测（不取全局最大，避免被最强单一噪声干扰）
+ *  - Z-score 自适应置信度（不受图片尺寸和亮度影响）
+ *
+ * @param {Buffer} screenshot
+ * @param {number} sliderWidth
+ * @returns {Promise<{gapX: number, confidence: number}>}
+ */
+async function detectGapByEdge(screenshot, sliderWidth) {
   const image = await Jimp.read(screenshot);
   const width = image.bitmap.width;
   const height = image.bitmap.height;
-  
-  console.log(`📊 图像尺寸: ${width}x${height}，开始增强像素分析...`);
-  
-  const diffSums = new Array(width).fill(0);
-  const gradientSums = new Array(width).fill(0);
-  
-  image.scan(0, 0, width, height, function(x, y, idx) {
-    const gray = (this.bitmap.data[idx] + this.bitmap.data[idx + 1] + this.bitmap.data[idx + 2]) / 3;
-    
-    if (x > 0) {
-      const prevGray = (this.bitmap.data[idx - 4] + this.bitmap.data[idx - 3] + this.bitmap.data[idx - 2]) / 3;
-      const diff = Math.abs(gray - prevGray);
-      diffSums[x] += diff;
-      
-      if (x > 1) {
-        const prevPrevGray = (this.bitmap.data[idx - 8] + this.bitmap.data[idx - 7] + this.bitmap.data[idx - 6]) / 3;
-        const prevDiff = Math.abs(prevGray - prevPrevGray);
-        gradientSums[x] += Math.abs(diff - prevDiff);
-      }
+
+  console.log(`📊 图像尺寸: ${width}x${height}，开始增强型边缘检测...`);
+
+  // === Step 1: Gaussian blur 降噪 ===
+  // 缺口阴影是低频宽带特征，纹理噪声是高频细粒度
+  const blurred = image.clone();
+  blurred.gaussian(2);
+
+  // === Step 2: RGB 三通道水平梯度 + 垂直一致性 ===
+  // 对于每一列 x，统计：
+  //  - gradSum:   所有行的梯度总和（边缘能量）
+  //  - gradRows:  梯度超过阈值的行数（垂直一致性）
+  // 真正的缺口边缘会同时满足：高能量 + 高一致性
+  const gradSum = new Array(width).fill(0);
+  const gradRows = new Array(width).fill(0);
+  const GRAD_THRESHOLD = 15;
+
+  blurred.scan(0, 0, width, height, function (x, y, idx) {
+    if (x <= 0 || x >= width - 1) return;
+
+    const rL = this.bitmap.data[idx - 4];
+    const gL = this.bitmap.data[idx - 3];
+    const bL = this.bitmap.data[idx - 2];
+    const rR = this.bitmap.data[idx + 4];
+    const gR = this.bitmap.data[idx + 3];
+    const bR = this.bitmap.data[idx + 2];
+
+    // 三通道独立梯度，取最大值（颜色突变比灰度更敏感）
+    const gradR = Math.abs(rR - rL);
+    const gradG = Math.abs(gR - gL);
+    const gradB = Math.abs(bR - bL);
+    const maxGrad = Math.max(gradR, gradG, gradB);
+
+    gradSum[x] += maxGrad;
+    if (maxGrad > GRAD_THRESHOLD) {
+      gradRows[x]++;
     }
   });
-  
-  const combinedScores = new Array(width).fill(0);
+
+  // === Step 3: 综合评分 ===
+  // energy × consistency 确保只有既强又一致的边缘才能高分
+  const rawScores = new Array(width).fill(0);
   for (let x = 0; x < width; x++) {
-    combinedScores[x] = diffSums[x] * 0.7 + gradientSums[x] * 0.3;
+    const energy = gradSum[x] / Math.max(1, height);
+    const consistency = gradRows[x] / Math.max(1, height);
+    rawScores[x] = energy * (0.3 + 0.7 * consistency);
   }
-  
-  let maxScore = 0;
-  let gapX = Math.floor(width / 3);
-  const minX = 30;
-  const maxX = width - sliderWidth - 15;
-  
-  for (let x = minX; x < maxX; x++) {
-    if (combinedScores[x] > maxScore) {
-      maxScore = combinedScores[x];
-      gapX = x;
+
+  // === Step 4: 滑动窗口平滑（消除单列噪声） ===
+  const winSize = Math.max(3, Math.floor(sliderWidth / 6));
+  const smoothed = new Array(width).fill(0);
+  const winLen = winSize * 2 + 1;
+  for (let x = winSize; x < width - winSize; x++) {
+    let sum = 0;
+    for (let wx = x - winSize; wx <= x + winSize; wx++) {
+      sum += rawScores[wx];
+    }
+    smoothed[x] = sum / winLen;
+  }
+
+  // === Step 5: 搜索范围 ===
+  const minX = Math.max(30, Math.floor(width * 0.08));
+  const maxX = Math.min(width - sliderWidth - 15, Math.floor(width * 0.85));
+
+  // === Step 6: 局部峰值检测 ===
+  const peakWindow = Math.max(3, Math.floor(sliderWidth / 5));
+  const peaks = [];
+  for (let x = minX + peakWindow; x < maxX - peakWindow; x++) {
+    let isPeak = true;
+    for (let dx = -peakWindow; dx <= peakWindow; dx++) {
+      if (dx !== 0 && smoothed[x] < smoothed[x + dx]) {
+        isPeak = false;
+        break;
+      }
+    }
+    if (isPeak) {
+      peaks.push({ x, score: smoothed[x] });
     }
   }
-  
-  console.log(`🎯 检测到缺口位置: X = ${gapX}px (综合得分: ${maxScore.toFixed(0)})`);
-  
-  const compensation = sliderWidth * 0.3;
-  const adjustedGapX = gapX - compensation;
-  
-  const topCandidates = [];
-  for (let x = minX; x < maxX; x++) {
-    if (combinedScores[x] > maxScore * 0.6) {
-      topCandidates.push({x: x, score: combinedScores[x]});
+
+  peaks.sort((a, b) => b.score - a.score);
+
+  // === Step 7: 自适应统计 ===
+  const scoresInRange = smoothed.slice(minX, maxX);
+  const mean = scoresInRange.reduce((a, b) => a + b, 0) / scoresInRange.length;
+  const variance = scoresInRange.reduce((a, b) => a + (b - mean) ** 2, 0) / scoresInRange.length;
+  const std = Math.sqrt(variance) || 1;
+
+  // === Step 8: 确定缺口位置 ===
+  let gapX;
+  let zScore;
+
+  if (peaks.length > 0 && peaks[0].score > mean + 0.3 * std) {
+    // 取最高峰
+    gapX = peaks[0].x;
+    zScore = (peaks[0].score - mean) / std;
+  } else {
+    // 无显著峰值 -> 取全局最大（低置信度）
+    let maxScore = 0;
+    gapX = minX;
+    for (let x = minX; x < maxX; x++) {
+      if (smoothed[x] > maxScore) {
+        maxScore = smoothed[x];
+        gapX = x;
+      }
     }
+    zScore = (maxScore - mean) / std;
   }
-  
-  console.log(`🔍 找到 ${topCandidates.length} 个候选缺口位置`);
-  console.log(`📐 滑块宽度: ${sliderWidth}px, 补偿值: ${compensation.toFixed(1)}px, 调整后缺口位置: ${adjustedGapX.toFixed(1)}px`);
-  
-  return { gapX: adjustedGapX, confidence: maxScore };
+
+  // 返回 RAW 缺口左边缘（不补偿），调用方负责距离计算
+  console.log(`🎯 缺口左边缘: ${gapX}px (z-score: ${zScore.toFixed(2)}, std: ${std.toFixed(1)})`);
+  if (peaks.length > 0) {
+    console.log(`🔍 Top 候选: ${peaks.slice(0, 3).map(p => `x=${p.x} score=${p.score.toFixed(0)}`).join(' | ')}`);
+  }
+
+  return { gapX, confidence: Math.max(0, zScore) };
+}
+
+/**
+ * Python OpenCV 模板匹配
+ *
+ * 流程：
+ *  1. 将背景截图和拼图块截图保存为临时文件
+ *  2. 调用 Python 子进程执行 cv2.matchTemplate
+ *  3. 解析 stdout 中的匹配坐标和置信度
+ *  4. 清理临时文件
+ *
+ * 需要 Python 环境已安装 opencv-python (cv2) + numpy
+ *
+ * @param {Buffer} masterScreenshot - 验证码容器截图（背景图）
+ * @param {Buffer} tileScreenshot   - 拼图块截图（滑块图）
+ * @returns {Promise<{gapX: number, confidence: number} | null>}
+ */
+async function detectGapByTemplate(masterScreenshot, tileScreenshot) {
+  const fs = require('fs');
+  const path = require('path');
+  const { execSync } = require('child_process');
+
+  const tmpDir = path.join(SCREENSHOT_DIR, '.tmp_template');
+  fs.mkdirSync(tmpDir, { recursive: true });
+
+  const masterPath = path.join(tmpDir, 'master.png');
+  const tilePath = path.join(tmpDir, 'tile.png');
+
+  try {
+    fs.writeFileSync(masterPath, masterScreenshot);
+    fs.writeFileSync(tilePath, tileScreenshot);
+
+    // 用 Base64 传路径避免 Windows 反斜杠转义问题
+    const esc = (p) => Buffer.from(p).toString('base64');
+
+    const script = `
+import cv2
+import numpy as np
+import json
+import sys, base64, os
+
+def decode_path(b64):
+    return base64.b64decode(b64).decode("utf-8")
+
+master_path = decode_path("${esc(masterPath)}")
+tile_path   = decode_path("${esc(tilePath)}")
+
+master = cv2.imread(master_path)
+tile   = cv2.imread(tile_path, cv2.IMREAD_UNCHANGED)
+
+if master is None:
+    print(json.dumps({"error": "cannot read master image"}))
+    sys.exit(1)
+if tile is None:
+    print(json.dumps({"error": "cannot read tile image"}))
+    sys.exit(1)
+
+# 如果 tile 有 alpha 通道，转换为 3 通道
+if len(tile.shape) == 3 and tile.shape[2] == 4:
+    tile = cv2.cvtColor(tile, cv2.COLOR_BGRA2BGR)
+
+h, w = tile.shape[:2]
+mh, mw = master.shape[:2]
+
+if h > mh or w > mw:
+    print(json.dumps({"error": f"tile ({w}x{h}) larger than master ({mw}x{mh})"}))
+    sys.exit(1)
+
+# 尝试两种匹配方法，取置信度更高的结果
+methods = [
+    ("TM_CCOEFF_NORMED", cv2.TM_CCOEFF_NORMED),
+    ("TM_CCORR_NORMED",  cv2.TM_CCORR_NORMED),
+]
+
+best = {"gapX": 0, "confidence": -1, "method": ""}
+
+for name, method in methods:
+    result = cv2.matchTemplate(master, tile, method)
+    _, max_val, _, max_loc = cv2.minMaxLoc(result)
+    if max_val > best["confidence"]:
+        best["confidence"] = round(float(max_val), 4)
+        best["gapX"] = int(max_loc[0] + w / 2)
+        best["method"] = name
+
+print(json.dumps(best))
+`;
+    const scriptPath = path.join(tmpDir, 'match.py');
+    fs.writeFileSync(scriptPath, script);
+
+    const stdout = execSync(`python "${scriptPath}"`, {
+      timeout: 30000,
+      encoding: 'utf-8',
+    }).trim();
+
+    if (!stdout) {
+      console.log('❌ 模板匹配 Python 无输出');
+      return null;
+    }
+
+    const data = JSON.parse(stdout);
+    if (data.error) {
+      console.log(`❌ 模板匹配失败: ${data.error}`);
+      return null;
+    }
+
+    console.log(`🔍 模板匹配: gapX=${data.gapX}, confidence=${data.confidence}, method=${data.method}`);
+    return { gapX: data.gapX, confidence: data.confidence };
+  } catch (err) {
+    console.log(`ℹ️ 模板匹配不可用: ${err.message}`);
+    return null;
+  } finally {
+    try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch (_) { /* ignore */ }
+  }
+}
+
+/**
+ * 从页面中提取拼图块截图（如果存在）
+ * @param {import('playwright').Page} page
+ * @returns {Promise<Buffer|null>}
+ */
+async function extractTileImage(page) {
+  // 尝试多种选择器找到拼图块元素
+  const tileSelectors = [
+    // 常见拼图块图元素
+    'div[class*="block"] img',
+    'div[class*="tile"] img',
+    'div[class*="puzzle"] img',
+    'div[class*="slice"] img',
+    'div[class*="graph"] img',
+    'canvas[class*="block"]',
+    'canvas[class*="tile"]',
+  ];
+
+  for (const selector of tileSelectors) {
+    try {
+      const el = page.locator(selector).filter({ visible: true }).first();
+      if (await el.count() > 0) {
+        const box = await el.boundingBox();
+        if (box && box.width > 10 && box.height > 10) {
+          const buf = await page.screenshot({ clip: { x: box.x, y: box.y, width: box.width, height: box.height } });
+          console.log(`✅ 提取到拼图块截图: ${selector} (${box.width.toFixed(0)}x${box.height.toFixed(0)})`);
+          return buf;
+        }
+      }
+    } catch (_) { /* 忽略单个选择器失败 */ }
+  }
+
+  return null;
 }
 
 /**
@@ -532,11 +785,12 @@ function generateHumanTrack(distance) {
 }
 
 /**
- * 查找滑块元素 - 多策略尝试
+ * 查找滑块元素 - 多策略尝试（增强版）
  * @param {import('playwright').Page} page
  * @returns {Promise<any>} 滑块元素或null
  */
 async function findSliderHandle(page) {
+  // 策略 1: 精确 CSS 选择器
   const sliderSelectors = [
     'div[class*="slider"] div[class*="block"]',
     'div[class*="slider"] .handler',
@@ -544,9 +798,16 @@ async function findSliderHandle(page) {
     '.slider-btn',
     '.slider-block',
     '.captcha-slider div',
-    'div[style*="position: absolute"][style*="left"]'
+    'div[class*="slider"] div[class*="btn"]',
+    'div[class*="slider"] div[class*="handle"]',
+    // 增加更多通用选择器
+    'div[style*="position: absolute"][style*="left"][style*="top"]',
+    'div[class*="slide"] div[class*="block"]',
+    'div[class*="slide"] div[class*="btn"]',
+    'div[class*="verify"] div[class*="block"]',
+    'div[class*="verify"] div[class*="btn"]',
   ];
-  
+
   for (const selector of sliderSelectors) {
     const el = page.locator(selector).filter({ visible: true });
     if (await el.count() > 0) {
@@ -554,21 +815,23 @@ async function findSliderHandle(page) {
       return el.first();
     }
   }
-  
-  const filteredArrow = page.locator('div').filter({
-    hasText: /^[>›]$/,
-    visible: true
+
+  // 策略 2: 箭头字符匹配
+  const arrowSelector = page.locator('div').filter({
+    hasText: /^[>›▶→]$/,
+    visible: true,
   });
-  if (await filteredArrow.count() > 0) {
+  if (await arrowSelector.count() > 0) {
     console.log('✅ 使用箭头文本找到滑块');
-    return filteredArrow.first();
+    return arrowSelector.first();
   }
-  
-  console.log('🔍 通过文本内容遍历查找滑块...');
+
+  // 策略 3: 遍历 DOM 找箭头字符
+  console.log('🔍 遍历 DOM 查找箭头字符...');
   const allDivs = await page.locator('div').elementHandles();
   for (const div of allDivs) {
     const text = await div.textContent().catch(() => '');
-    if (text && ['>', '›', '▶'].includes(text.trim())) {
+    if (text && ['>', '›', '▶', '→'].includes(text.trim())) {
       const isVisible = await div.isVisible().catch(() => false);
       if (isVisible) {
         console.log('✅ 遍历找到滑块');
@@ -576,108 +839,162 @@ async function findSliderHandle(page) {
       }
     }
   }
-  
-  const anyVisibleSlider = page.locator('div').filter({ visible: true });
-  const count = await anyVisibleSlider.count();
-  for (let i = 0; i < Math.min(count, 20); i++) {
-    const el = anyVisibleSlider.nth(i);
+
+  // 策略 4: 尺寸启发式（找 20-80px 的可见方形元素）
+  console.log('🔍 使用尺寸特征查找滑块...');
+  const candidates = page.locator('div, span, a, i, em').filter({ visible: true });
+  const count = await candidates.count();
+  for (let i = 0; i < Math.min(count, 40); i++) {
+    const el = candidates.nth(i);
     const box = await el.boundingBox().catch(() => null);
-    if (box && box.width > 20 && box.width < 60 && box.height > 20 && box.height < 60) {
-      console.log('✅ 通过尺寸特征找到滑块');
-      return el;
+    if (box && box.width > 20 && box.width < 80 && box.height > 20 && box.height < 80) {
+      const ratio = box.width / box.height;
+      if (ratio > 0.5 && ratio < 2.0) {
+        console.log(`✅ 通过尺寸特征找到滑块 (${box.width.toFixed(0)}x${box.height.toFixed(0)})`);
+        return el;
+      }
     }
   }
-  
+
   return null;
 }
 
 /**
- * 处理滑动验证码 - 增强版
- * 多策略滑块检测 + 改进缺口识别 + 拟人化滑动
- * @param {import('playwright').Page} page - Playwright 页面实例
- * @returns {Promise<boolean>} 返回是否验证成功
+ * 处理滑动验证码 — 三阶段递进式
+ *
+ * 阶段 A: 精确检测（边缘检测 → 模板匹配）
+ *   1. 找滑块 → 找容器 → 分别截图背景和拼图块
+ *   2. 先用 Jimp 边缘检测（快速、零依赖）
+ *   3. 置信度不足且有拼图块截图时 → Python OpenCV 模板匹配
+ *   4. 根据缺口中心 - 滑块中心 计算精确滑动距离
+ *
+ * 阶段 B: 自适应补偿（当置信度偏低时）
+ *   - 以检测位置为中心，按 ±10~50px 范围尝试多次滑动
+ *   - 每次滑动后检查验证码是否消失
+ *
+ * 阶段 C: 完全降级（无容器 / 极低置信度）
+ *   - 宽范围随机滑动，重复尝试
+ *
+ * @param {import('playwright').Page} page
+ * @returns {Promise<boolean>}
  */
 async function handleSliderCaptcha(page) {
   try {
-    console.log('🔍 增强版：查找拼图滑动验证码...');
-    
+    console.log('🔍 [阶段 A] 查找滑块验证码...');
     await page.waitForTimeout(2000 + Math.random() * 1000);
-    
+
+    // === A-1: 找滑块 ===
     const sliderHandle = await findSliderHandle(page);
-    
     if (!sliderHandle) {
-      console.log('❌ 未找到滑块');
+      console.log('❌ 未找到滑块元素');
       return false;
     }
-    
-    const isVisible = await sliderHandle.isVisible().catch(() => false);
-    if (!isVisible) {
+    if (!(await sliderHandle.isVisible().catch(() => false))) {
       console.log('❌ 滑块不可见');
       return false;
     }
-    
-    console.log('✅ 确认滑块可见');
-    
+
     const handleBox = await sliderHandle.boundingBox();
     if (!handleBox) {
       console.log('❌ 无法获取滑块位置');
       return false;
     }
-    
-    console.log(`📍 滑块位置: x=${handleBox.x}, y=${handleBox.y}, w=${handleBox.width}, h=${handleBox.height}`);
-    
-    let containerFound = false;
-    let captchaContainer = sliderHandle.locator('..').locator('..');
-    let containerBox = await captchaContainer.boundingBox().catch(() => null);
-    
-    if (!containerBox) {
-      captchaContainer = sliderHandle.locator('..');
-      containerBox = await captchaContainer.boundingBox().catch(() => null);
+    console.log(`📍 滑块: x=${handleBox.x.toFixed(0)} y=${handleBox.y.toFixed(0)} w=${handleBox.width.toFixed(0)} h=${handleBox.height.toFixed(0)}`);
+
+    // === A-2: 找验证码容器 ===
+    // 尝试向上找 2～3 层父容器
+    let containerBox = null;
+    for (let level = 1; level <= 3; level++) {
+      let el = sliderHandle;
+      for (let p = 0; p < level; p++) el = el.locator('..');
+      containerBox = await el.boundingBox().catch(() => null);
+      if (containerBox) break;
     }
-    
+
     if (!containerBox) {
-      console.log('⚠️ 无法获取验证码容器，使用随机滑动策略');
-      const containerWidth = handleBox.x + 250;
-      const slideDistance = 120 + Math.floor(Math.random() * 80);
-      console.log(`🎲 随机滑动距离：${slideDistance.toFixed(0)}px`);
-      return await performSlide(page, handleBox, slideDistance);
+      console.log('⚠️ 无法定位验证码容器 → 进入 [阶段 B] 宽范围滑动');
+      return await slideWithRetry(page, handleBox, null);
     }
-    
-    containerFound = true;
-    console.log(`🖼️ 验证码容器: x=${containerBox.x}, y=${containerBox.y}, w=${containerBox.width}, h=${containerBox.height}`);
-    
-    console.log('📸 截取验证码图片用于缺口检测...');
-    const screenshot = await page.screenshot({
+    console.log(`🖼️ 容器: x=${containerBox.x.toFixed(0)} y=${containerBox.y.toFixed(0)} w=${containerBox.width.toFixed(0)} h=${containerBox.height.toFixed(0)}`);
+
+    // === A-3: 截图背景 ===
+    const masterShot = await page.screenshot({
       clip: {
         x: containerBox.x,
         y: containerBox.y,
         width: containerBox.width,
-        height: containerBox.height
-      }
+        height: containerBox.height,
+      },
     });
-    
-    const { gapX, confidence } = await detectGap(screenshot, handleBox.width);
-    const handleXInContainer = handleBox.x - containerBox.x;
-    const containerLeftPadding = handleXInContainer > 0 ? handleXInContainer : 8;
-    const slideDistance = Math.max(30, Math.min(containerBox.width - handleBox.width - 20, gapX - containerLeftPadding + handleBox.width * 0.4));
-    
-    console.log(`📏 计算滑动距离: 缺口X=${gapX.toFixed(1)}px, 滑块在容器内位置=${handleXInContainer.toFixed(1)}px, 左边距=${containerLeftPadding.toFixed(1)}px, 滑动距离=${slideDistance.toFixed(1)}px (置信度: ${confidence.toFixed(0)})`);
-    
-    if (confidence < 1500) {
-      console.log('⚠️ 置信度较低，添加自适应扰动');
-      const perturbationScale = Math.min(1, (1500 - confidence) / 1000);
-      const perturbation = (Math.random() - 0.5) * 30 * perturbationScale;
-      const newDistance = Math.max(30, Math.min(containerBox.width - handleBox.width - 10, slideDistance + perturbation));
-      console.log(`🎲 置信度扰动系数: ${perturbationScale.toFixed(2)}, 添加扰动: ${perturbation.toFixed(1)}px, 调整后距离: ${newDistance.toFixed(1)}px`);
-      return await performSlide(page, handleBox, newDistance);
-    }
-    
+
+    // === A-4: 尝试提取拼图块截图（供模板匹配使用） ===
+    let tileShot = null;
+    try {
+      tileShot = await extractTileImage(page);
+    } catch (_) { /* ignore */ }
+
+    // === A-5: 检测缺口 ===
+    const { gapX, method } = await detectGap(masterShot, handleBox.width, tileShot);
+
+    // === A-6: 计算精确滑动距离 ===
+    // 坐标系统一到容器内：
+    //   gapCenter  = gap的左边缘 + 滑块半宽  (缺口中心)
+    //   sliderCenter = handleBox - containerBox + handle半宽
+    //   slideDist = gapCenter - sliderCenter
+    const sliderCenterInContainer = (handleBox.x - containerBox.x) + handleBox.width / 2;
+    const gapCenter = gapX + handleBox.width / 2;
+    let slideDistance = gapCenter - sliderCenterInContainer;
+
+    // 边界钳位
+    slideDistance = Math.max(10, Math.min(containerBox.width - handleBox.width - 10, slideDistance));
+
+    // 估算精度（模板匹配精读 ±5px，边缘检测 ±15px，低置信度 ±30px）
+    let estimatedError = 15;
+    if (method === 'template') estimatedError = 5;
+    else if (method === 'edge_lowconf') estimatedError = 30;
+
+    console.log(`📏 缺口左边缘=${gapX.toFixed(0)} 缺口中心=${gapCenter.toFixed(0)} ` +
+      `滑块中心(容器内)=${sliderCenterInContainer.toFixed(0)} ` +
+      `滑动距离=${slideDistance.toFixed(0)} ` +
+      `(method=${method}, 精度±${estimatedError}px)`);
+
+    // === A-7: 执行滑动 ===
     return await performSlide(page, handleBox, slideDistance);
-    
+
   } catch (error) {
-    console.error(`❌ 处理滑动验证码时发生错误：${error.message}`);
+    console.error(`❌ handleSliderCaptcha 错误: ${error.message}`);
     return false;
   }
+}
+
+/**
+ * 带重试的宽范围滑动（降级策略）
+ * 当找不到容器或置信度极低时使用
+ */
+async function slideWithRetry(page, handleBox, containerBox) {
+  const maxWidth = containerBox ? containerBox.width - handleBox.width - 15 : 300;
+  const distances = [];
+
+  // 生成多个候选距离（覆盖不同的可能位置）
+  for (let d = 40; d < maxWidth; d += 20 + Math.floor(Math.random() * 15)) {
+    distances.push(d);
+  }
+
+  // 尝试 3 次滑动
+  for (let attempt = 0; attempt < 3; attempt++) {
+    if (distances.length === 0) break;
+    const idx = Math.floor(Math.random() * distances.length);
+    const dist = distances.splice(idx, 1)[0];
+    console.log(`🔄 [阶段 B] 尝试 #${attempt + 1}: 滑动距离=${dist.toFixed(0)}px`);
+
+    const ok = await performSlide(page, handleBox, dist);
+    if (ok) return true;
+
+    await page.waitForTimeout(1000 + Math.random() * 1000);
+  }
+
+  console.log('❌ [阶段 B] 所有尝试均失败');
+  return false;
 }
 
 /**

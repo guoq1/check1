@@ -1,6 +1,5 @@
 # 忽略签到密钥文件
 .env
-1lou.py
 
 # 忽略依赖目录
 node_modules/
