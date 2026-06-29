@@ -437,15 +437,18 @@ async function detectGapByEdge(screenshot, sliderWidth) {
   const blurred = image.clone();
   blurred.gaussian(2);
 
-  // === Step 2: RGB 三通道水平梯度 + 垂直一致性 ===
+  // === Step 2: RGB 三通道水平梯度 ===
   // 对于每一列 x，统计：
   //  - gradSum:   所有行的梯度总和（边缘能量）
-  //  - gradRows:  梯度超过阈值的行数（垂直一致性）
-  // 真正的缺口边缘会同时满足：高能量 + 高一致性
+  //  - gradRows:  梯度超过自适应阈值的行数（垂直一致性）
+  //
+  // 自适应阈值：先收集所有梯度值，取中位数的 2 倍作为阈值
+  // 这样在低对比度图片中阈值自动降低，高对比度中自动升高
   const gradSum = new Array(width).fill(0);
   const gradRows = new Array(width).fill(0);
-  const GRAD_THRESHOLD = 15;
 
+  // 先扫一遍收集所有梯度值，用于自适应阈值
+  const allGrads = [];
   blurred.scan(0, 0, width, height, function (x, y, idx) {
     if (x <= 0 || x >= width - 1) return;
 
@@ -456,14 +459,31 @@ async function detectGapByEdge(screenshot, sliderWidth) {
     const gR = this.bitmap.data[idx + 3];
     const bR = this.bitmap.data[idx + 2];
 
-    // 三通道独立梯度，取最大值（颜色突变比灰度更敏感）
-    const gradR = Math.abs(rR - rL);
-    const gradG = Math.abs(gR - gL);
-    const gradB = Math.abs(bR - bL);
-    const maxGrad = Math.max(gradR, gradG, gradB);
-
+    const maxGrad = Math.max(Math.abs(rR - rL), Math.abs(gR - gL), Math.abs(bR - bL));
     gradSum[x] += maxGrad;
-    if (maxGrad > GRAD_THRESHOLD) {
+    allGrads.push(maxGrad);
+  });
+
+  // 计算自适应阈值：取所有梯度的中位数 × 2
+  allGrads.sort((a, b) => a - b);
+  const medianIdx = Math.floor(allGrads.length / 2);
+  const medianGrad = allGrads[medianIdx] || 0;
+  const adaptiveThreshold = Math.max(8, Math.min(40, medianGrad * 2));
+  console.log(`📊 梯度统计: median=${medianGrad.toFixed(0)}, 自适应阈值=${adaptiveThreshold.toFixed(0)}`);
+
+  // 用自适应阈值重新算垂直一致性
+  blurred.scan(0, 0, width, height, function (x, y, idx) {
+    if (x <= 0 || x >= width - 1) return;
+
+    const rL = this.bitmap.data[idx - 4];
+    const gL = this.bitmap.data[idx - 3];
+    const bL = this.bitmap.data[idx - 2];
+    const rR = this.bitmap.data[idx + 4];
+    const gR = this.bitmap.data[idx + 3];
+    const bR = this.bitmap.data[idx + 2];
+
+    const maxGrad = Math.max(Math.abs(rR - rL), Math.abs(gR - gL), Math.abs(bR - bL));
+    if (maxGrad > adaptiveThreshold) {
       gradRows[x]++;
     }
   });
@@ -860,30 +880,26 @@ async function findSliderHandle(page) {
 }
 
 /**
- * 处理滑动验证码 — 三阶段递进式
+ * 处理滑动验证码 — 多枪连发策略
  *
- * 阶段 A: 精确检测（边缘检测 → 模板匹配）
- *   1. 找滑块 → 找容器 → 分别截图背景和拼图块
- *   2. 先用 Jimp 边缘检测（快速、零依赖）
- *   3. 置信度不足且有拼图块截图时 → Python OpenCV 模板匹配
- *   4. 根据缺口中心 - 滑块中心 计算精确滑动距离
+ * 核心思路：不信任单次检测精度，改为在检测位置附近 ±28px 范围
+ * 尝试多次滑动，大幅提高命中率。
  *
- * 阶段 B: 自适应补偿（当置信度偏低时）
- *   - 以检测位置为中心，按 ±10~50px 范围尝试多次滑动
- *   - 每次滑动后检查验证码是否消失
- *
- * 阶段 C: 完全降级（无容器 / 极低置信度）
- *   - 宽范围随机滑动，重复尝试
+ * 流程：
+ *  1. 找滑块 → 找容器 → 截图 → 检测缺口位置
+ *  2. 以检测位置为中心，生成 [0, ±7, ±14, ±21, ±28] 偏移序列
+ *  3. 逐个尝试，每次尝试前刷新滑块位置
+ *  4. 任一尝试成功即返回
  *
  * @param {import('playwright').Page} page
  * @returns {Promise<boolean>}
  */
 async function handleSliderCaptcha(page) {
   try {
-    console.log('🔍 [阶段 A] 查找滑块验证码...');
-    await page.waitForTimeout(2000 + Math.random() * 1000);
+    console.log('🔍 查找滑块验证码...');
+    await page.waitForTimeout(1500 + Math.random() * 1000);
 
-    // === A-1: 找滑块 ===
+    // === 1. 找滑块 ===
     const sliderHandle = await findSliderHandle(page);
     if (!sliderHandle) {
       console.log('❌ 未找到滑块元素');
@@ -901,8 +917,7 @@ async function handleSliderCaptcha(page) {
     }
     console.log(`📍 滑块: x=${handleBox.x.toFixed(0)} y=${handleBox.y.toFixed(0)} w=${handleBox.width.toFixed(0)} h=${handleBox.height.toFixed(0)}`);
 
-    // === A-2: 找验证码容器 ===
-    // 尝试向上找 2～3 层父容器
+    // === 2. 找验证码容器 ===
     let containerBox = null;
     for (let level = 1; level <= 3; level++) {
       let el = sliderHandle;
@@ -912,54 +927,63 @@ async function handleSliderCaptcha(page) {
     }
 
     if (!containerBox) {
-      console.log('⚠️ 无法定位验证码容器 → 进入 [阶段 B] 宽范围滑动');
+      console.log('⚠️ 无法定位验证码容器，使用宽范围滑动');
       return await slideWithRetry(page, handleBox, null);
     }
     console.log(`🖼️ 容器: x=${containerBox.x.toFixed(0)} y=${containerBox.y.toFixed(0)} w=${containerBox.width.toFixed(0)} h=${containerBox.height.toFixed(0)}`);
 
-    // === A-3: 截图背景 ===
+    // === 3. 截图 + 检测缺口 ===
     const masterShot = await page.screenshot({
-      clip: {
-        x: containerBox.x,
-        y: containerBox.y,
-        width: containerBox.width,
-        height: containerBox.height,
-      },
+      clip: { x: containerBox.x, y: containerBox.y, width: containerBox.width, height: containerBox.height },
     });
 
-    // === A-4: 尝试提取拼图块截图（供模板匹配使用） ===
     let tileShot = null;
-    try {
-      tileShot = await extractTileImage(page);
-    } catch (_) { /* ignore */ }
+    try { tileShot = await extractTileImage(page); } catch (_) { /* ignore */ }
 
-    // === A-5: 检测缺口 ===
     const { gapX, method } = await detectGap(masterShot, handleBox.width, tileShot);
 
-    // === A-6: 计算精确滑动距离 ===
-    // 坐标系统一到容器内：
-    //   gapCenter  = gap的左边缘 + 滑块半宽  (缺口中心)
-    //   sliderCenter = handleBox - containerBox + handle半宽
-    //   slideDist = gapCenter - sliderCenter
-    const sliderCenterInContainer = (handleBox.x - containerBox.x) + handleBox.width / 2;
-    const gapCenter = gapX + handleBox.width / 2;
-    let slideDistance = gapCenter - sliderCenterInContainer;
+    // === 4. 计算基准滑动距离 ===
+    // gapX 是缺口左边缘（容器内坐标）
+    // 滑块中心需要在容器内坐标下计算，然后算出滑块需要移动的距离
+    // 注意：performSlide 的起点是 handleBox.x + handleBox.width/2 (页面坐标)
+    //       而 gapX 是容器内坐标，所以：
+    //       slideDistance = (containerBox.x + gapX + 滑块半宽) - (handleBox.x + 滑块半宽)
+    //                      = containerBox.x + gapX - handleBox.x
+    //  简化：缺口中心页面坐标 = containerBox.x + gapX + sliderWidth/2
+    //        滑块中心页面坐标 = handleBox.x + sliderWidth/2
+    //        移动距离 = 缺口中心 - 滑块中心 = containerBox.x + gapX - handleBox.x
+    const baseDist = containerBox.x + gapX - handleBox.x;
+    const maxDist = containerBox.width - handleBox.width - 10;
 
     // 边界钳位
-    slideDistance = Math.max(10, Math.min(containerBox.width - handleBox.width - 10, slideDistance));
+    const clamp = (d) => Math.max(15, Math.min(maxDist, d));
 
-    // 估算精度（模板匹配精读 ±5px，边缘检测 ±15px，低置信度 ±30px）
-    let estimatedError = 15;
-    if (method === 'template') estimatedError = 5;
-    else if (method === 'edge_lowconf') estimatedError = 30;
+    // === 5. 多枪连发 ===
+    // 按偏移量从 0 开始，逐渐扩大搜索范围
+    const offsets = [0, 7, -7, 14, -14, 21, -21, 28, -28];
+    // 根据检测方法动态调整偏移范围
+    const maxOffset = method === 'template' ? 14 : (method === 'edge' ? 21 : 28);
 
-    console.log(`📏 缺口左边缘=${gapX.toFixed(0)} 缺口中心=${gapCenter.toFixed(0)} ` +
-      `滑块中心(容器内)=${sliderCenterInContainer.toFixed(0)} ` +
-      `滑动距离=${slideDistance.toFixed(0)} ` +
-      `(method=${method}, 精度±${estimatedError}px)`);
+    console.log(`📏 基准距离=${baseDist.toFixed(0)}px, method=${method}, 最大偏移=${maxOffset}px, 尝试 ${1 + offsets.filter(o => Math.abs(o) <= maxOffset).length} 次`);
 
-    // === A-7: 执行滑动 ===
-    return await performSlide(page, handleBox, slideDistance);
+    for (const offset of offsets) {
+      if (Math.abs(offset) > maxOffset) continue;
+
+      const dist = clamp(baseDist + offset);
+      console.log(`🔄 尝试 offset=${offset >= 0 ? '+' : ''}${offset}px → 滑动距离=${dist.toFixed(0)}px`);
+
+      const ok = await performSlide(page, handleBox, dist);
+      if (ok) {
+        console.log(`✅ offset=${offset}px 命中！`);
+        return true;
+      }
+
+      // 每次尝试后短暂等待（让滑块可能自动复位）
+      await page.waitForTimeout(600 + Math.random() * 400);
+    }
+
+    console.log('❌ 所有偏移尝试均失败');
+    return false;
 
   } catch (error) {
     console.error(`❌ handleSliderCaptcha 错误: ${error.message}`);
@@ -1323,11 +1347,14 @@ async function autoCheckin() {
     // 尝试保存错误截图
     if (browser) {
       try {
-        const pages = await browser.pages();
-        if (pages.length > 0) {
-          const errorScreenshotPath = path.join(SCREENSHOT_DIR, 'error_screenshot.png');
-          await pages[0].screenshot({ path: errorScreenshotPath, fullPage: true });
-          console.log(`📸 已保存错误页面截图: ${errorScreenshotPath}`);
+        const contexts = browser.contexts();
+        if (contexts.length > 0) {
+          const pages = contexts[0].pages();
+          if (pages.length > 0) {
+            const errorScreenshotPath = path.join(SCREENSHOT_DIR, 'error_screenshot.png');
+            await pages[0].screenshot({ path: errorScreenshotPath, fullPage: true });
+            console.log(`📸 已保存错误页面截图: ${errorScreenshotPath}`);
+          }
         }
       } catch (screenshotError) {
         console.error(`截图保存失败: ${screenshotError.message}`);
