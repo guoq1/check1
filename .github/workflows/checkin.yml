@@ -40,18 +40,15 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cache/ms-playwright
-          key: playwright-${{ runner.os }}-chromium-${{ hashFiles('package.json') }}
+          key: playwright-${{ runner.os }}-${{ hashFiles('package-lock.json') }}
           restore-keys: |
-            playwright-${{ runner.os }}-chromium-
+            playwright-${{ runner.os }}-
 
-      - name: Get dependencies
-        run: npm install
+      - name: Install dependencies
+        run: npm ci
 
-      - name: Install Playwright dependencies
-        run: npx playwright install-deps chromium || true
-
-      - name: Install Playwright browsers
-        run: npx playwright install chromium
+      - name: Install Playwright browsers with dependencies
+        run: npx playwright install chromium --with-deps
 
       - name: Run checkin script
         env:
@@ -59,17 +56,6 @@ jobs:
           LOG_LEVEL: ${{ inputs.log_level || 'info' }}
           FORCE_RUN: ${{ inputs.force_run || 'false' }}
         run: npm run checkin
-
-      - name: Upload checkin artifacts
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: checkin-results-${{ github.run_number }}
-          path: |
-            checkin.log
-            artifacts/*.png
-            artifacts/**/*.png
-          retention-days: 7
 
       - name: Show result
         if: always()

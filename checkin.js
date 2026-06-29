@@ -1150,17 +1150,8 @@ async function autoCheckin() {
     // 等待页面完全加载
     await page.waitForTimeout(2000 + Math.random() * 1000);
     
-    // 确保截图目录存在
-    fs.mkdirSync(SCREENSHOT_DIR, { recursive: true });
-    console.log(`📁 截图输出目录: ${path.resolve(SCREENSHOT_DIR)}`);
-
     // 优先尝试切换中文界面，再继续后续步骤
     await switchToChineseIfNeeded(page);
-
-    // 截图记录初始状态
-    const initialScreenshotPath = path.join(SCREENSHOT_DIR, '1_initial.png');
-    await page.screenshot({ path: initialScreenshotPath, fullPage: true });
-    console.log(`📸 已保存初始状态截图: ${initialScreenshotPath}`);
     
     // 检查是否已经登录（优先依据绑定邮箱/退出登录等稳定标识）
     const initialLoggedIn = await isLoggedIn(page);
@@ -1172,22 +1163,12 @@ async function autoCheckin() {
       
       const loginSuccess = await tryLoginWithRetry(page);
 
-      // 截图记录登录尝试后状态
-      const afterInputScreenshotPath = path.join(SCREENSHOT_DIR, '2_after_input.png');
-      await page.screenshot({ path: afterInputScreenshotPath, fullPage: true });
-      console.log(`📸 已保存登录尝试后截图: ${afterInputScreenshotPath}`);
-
       if (!loginSuccess) {
         throw new Error('多次重试后仍未登录成功（可能未登录或会话已过期）');
       }
 
       console.log('✅ 登录流程完成');
     }
-    
-    // 截图记录登录后状态
-    const loggedInScreenshotPath = path.join(SCREENSHOT_DIR, '3_logged_in.png');
-    await page.screenshot({ path: loggedInScreenshotPath, fullPage: true });
-    console.log(`📸 已保存登录后截图: ${loggedInScreenshotPath}`);
     
     // 点击"签到"或"签到续期"按钮 - 优先使用精确选择器
     console.log('🖱️ 寻找并点击签到按钮...');
@@ -1246,11 +1227,6 @@ async function autoCheckin() {
       throw new Error('验证码验证失败，无法继续签到');
     }
 
-    // 截图查看点击后的状态（含验证码处理结果）
-    const afterClickScreenshotPath = path.join(SCREENSHOT_DIR, '4_after_click.png');
-    await page.screenshot({ path: afterClickScreenshotPath, fullPage: true });
-    console.log(`📸 已保存点击后截图：${afterClickScreenshotPath}`);
-
     // 等待签到结果
     console.log('⏳ 等待签到结果...');
     await page.waitForTimeout(5000);
@@ -1281,11 +1257,6 @@ async function autoCheckin() {
     } catch (e) {
       console.log('⚠️ 日历加载超时，继续检查');
     }
-    
-    // 截图记录最终结果
-    const finalResultScreenshotPath = path.join(SCREENSHOT_DIR, '5_final_result.png');
-    await page.screenshot({ path: finalResultScreenshotPath, fullPage: true });
-    console.log(`📸 已保存最终结果截图: ${finalResultScreenshotPath}`);
     
     // 检查签到成功状态
     console.log('🔍 检查签到成功状态...');
@@ -1333,33 +1304,10 @@ async function autoCheckin() {
     
     console.log('⚠️ 未检测到明确的签到成功标志');
     
-    // 保存页面 HTML 以便调试
-    const pageHtml = await page.content();
-    const htmlPath = path.join(SCREENSHOT_DIR, 'debug_page.html');
-    fs.writeFileSync(htmlPath, pageHtml);
-    console.log(`📄 已保存页面 HTML: ${htmlPath}`);
-    
     return false;
     
   } catch (error) {
     console.error(`❌ 签到过程中发生错误: ${error.message}`);
-    
-    // 尝试保存错误截图
-    if (browser) {
-      try {
-        const contexts = browser.contexts();
-        if (contexts.length > 0) {
-          const pages = contexts[0].pages();
-          if (pages.length > 0) {
-            const errorScreenshotPath = path.join(SCREENSHOT_DIR, 'error_screenshot.png');
-            await pages[0].screenshot({ path: errorScreenshotPath, fullPage: true });
-            console.log(`📸 已保存错误页面截图: ${errorScreenshotPath}`);
-          }
-        }
-      } catch (screenshotError) {
-        console.error(`截图保存失败: ${screenshotError.message}`);
-      }
-    }
     
     throw error;
   } finally {
