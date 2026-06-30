@@ -430,24 +430,19 @@ async function detectGapByEdge(screenshot, sliderWidth) {
   const width = image.bitmap.width;
   const height = image.bitmap.height;
 
-  console.log(`📊 图像尺寸: ${width}x${height}，开始增强型边缘检测...`);
+  console.log(`📊 图像尺寸: ${width}x${height}，开始边缘检测...`);
 
-  // === Step 1: Gaussian blur 降噪 ===
-  // 缺口阴影是低频宽带特征，纹理噪声是高频细粒度
+  const isNarrow = height < 80;
+
+  // === Step 1: 根据图像高度选择不同的模糊策略 ===
+  const blurRadius = isNarrow ? 1 : 2;
   const blurred = image.clone();
-  blurred.gaussian(2);
+  blurred.gaussian(blurRadius);
 
   // === Step 2: RGB 三通道水平梯度 ===
-  // 对于每一列 x，统计：
-  //  - gradSum:   所有行的梯度总和（边缘能量）
-  //  - gradRows:  梯度超过自适应阈值的行数（垂直一致性）
-  //
-  // 自适应阈值：先收集所有梯度值，取中位数的 2 倍作为阈值
-  // 这样在低对比度图片中阈值自动降低，高对比度中自动升高
   const gradSum = new Array(width).fill(0);
   const gradRows = new Array(width).fill(0);
 
-  // 先扫一遍收集所有梯度值，用于自适应阈值
   const allGrads = [];
   blurred.scan(0, 0, width, height, function (x, y, idx) {
     if (x <= 0 || x >= width - 1) return;
@@ -464,14 +459,23 @@ async function detectGapByEdge(screenshot, sliderWidth) {
     allGrads.push(maxGrad);
   });
 
-  // 计算自适应阈值：取所有梯度的中位数 × 2
+  // === Step 3: 自适应阈值计算 ===
   allGrads.sort((a, b) => a - b);
   const medianIdx = Math.floor(allGrads.length / 2);
   const medianGrad = allGrads[medianIdx] || 0;
-  const adaptiveThreshold = Math.max(8, Math.min(40, medianGrad * 2));
-  console.log(`📊 梯度统计: median=${medianGrad.toFixed(0)}, 自适应阈值=${adaptiveThreshold.toFixed(0)}`);
+  const maxGrad = allGrads[allGrads.length - 1] || 0;
+  const p90Grad = allGrads[Math.floor(allGrads.length * 0.9)] || 0;
 
-  // 用自适应阈值重新算垂直一致性
+  // 窄验证码（高度<80）使用更激进的阈值策略
+  const thresholdFactor = isNarrow ? 0.8 : 1.2;
+  const maxAllowedFactor = isNarrow ? 0.5 : 0.7;
+  
+  const baseThreshold = medianGrad * thresholdFactor;
+  const maxAllowedThreshold = maxGrad * maxAllowedFactor;
+  const adaptiveThreshold = Math.max(5, Math.min(25, Math.min(baseThreshold, maxAllowedThreshold)));
+  console.log(`📊 梯度统计: median=${medianGrad.toFixed(0)}, max=${maxGrad.toFixed(0)}, p90=${p90Grad.toFixed(0)}, 阈值=${adaptiveThreshold.toFixed(0)} (窄图: ${isNarrow})`);
+
+  // === Step 4: 计算垂直一致性 ===
   blurred.scan(0, 0, width, height, function (x, y, idx) {
     if (x <= 0 || x >= width - 1) return;
 
@@ -488,17 +492,17 @@ async function detectGapByEdge(screenshot, sliderWidth) {
     }
   });
 
-  // === Step 3: 综合评分 ===
-  // energy × consistency 确保只有既强又一致的边缘才能高分
+  // === Step 5: 综合评分（窄图更侧重能量） ===
   const rawScores = new Array(width).fill(0);
+  const consistencyWeight = isNarrow ? 0.3 : 0.7;
   for (let x = 0; x < width; x++) {
     const energy = gradSum[x] / Math.max(1, height);
     const consistency = gradRows[x] / Math.max(1, height);
-    rawScores[x] = energy * (0.3 + 0.7 * consistency);
+    rawScores[x] = energy * ((1 - consistencyWeight) + consistencyWeight * consistency);
   }
 
-  // === Step 4: 滑动窗口平滑（消除单列噪声） ===
-  const winSize = Math.max(3, Math.floor(sliderWidth / 6));
+  // === Step 6: 滑动窗口平滑 ===
+  const winSize = isNarrow ? Math.max(2, Math.floor(sliderWidth / 8)) : Math.max(3, Math.floor(sliderWidth / 6));
   const smoothed = new Array(width).fill(0);
   const winLen = winSize * 2 + 1;
   for (let x = winSize; x < width - winSize; x++) {
@@ -509,12 +513,12 @@ async function detectGapByEdge(screenshot, sliderWidth) {
     smoothed[x] = sum / winLen;
   }
 
-  // === Step 5: 搜索范围 ===
-  const minX = Math.max(30, Math.floor(width * 0.08));
-  const maxX = Math.min(width - sliderWidth - 15, Math.floor(width * 0.85));
+  // === Step 7: 搜索范围 ===
+  const minX = Math.max(20, Math.floor(width * 0.05));
+  const maxX = Math.min(width - sliderWidth - 10, Math.floor(width * 0.9));
 
-  // === Step 6: 局部峰值检测 ===
-  const peakWindow = Math.max(3, Math.floor(sliderWidth / 5));
+  // === Step 8: 局部峰值检测（窄图用更小的窗口） ===
+  const peakWindow = isNarrow ? Math.max(2, Math.floor(sliderWidth / 7)) : Math.max(3, Math.floor(sliderWidth / 5));
   const peaks = [];
   for (let x = minX + peakWindow; x < maxX - peakWindow; x++) {
     let isPeak = true;
@@ -681,38 +685,100 @@ print(json.dumps(best))
 }
 
 /**
- * 从页面中提取拼图块截图（如果存在）
+ * 从页面 DOM 中提取拼图块图片数据（base64 data URL → Buffer）
+ * AJ-Captcha 的拼图块 image src 是 data:image/png;base64,...
+ *
  * @param {import('playwright').Page} page
- * @returns {Promise<Buffer|null>}
+ * @returns {Promise<{tile: Buffer|null, background: Buffer|null}>}
  */
-async function extractTileImage(page) {
-  // 尝试多种选择器找到拼图块元素
-  const tileSelectors = [
-    // 常见拼图块图元素
-    'div[class*="block"] img',
-    'div[class*="tile"] img',
-    'div[class*="puzzle"] img',
-    'div[class*="slice"] img',
-    'div[class*="graph"] img',
-    'canvas[class*="block"]',
-    'canvas[class*="tile"]',
-  ];
+async function extractCaptchaImages(page) {
+  const result = { tile: null, background: null };
 
-  for (const selector of tileSelectors) {
-    try {
-      const el = page.locator(selector).filter({ visible: true }).first();
-      if (await el.count() > 0) {
-        const box = await el.boundingBox();
-        if (box && box.width > 10 && box.height > 10) {
-          const buf = await page.screenshot({ clip: { x: box.x, y: box.y, width: box.width, height: box.height } });
-          console.log(`✅ 提取到拼图块截图: ${selector} (${box.width.toFixed(0)}x${box.height.toFixed(0)})`);
-          return buf;
+  // 策略 1: 通过 DOM 获取拼图块的 base64 src
+  try {
+    const tileData = await page.evaluate(() => {
+      // AJ-Captcha 拼图块选择器
+      const selectors = [
+        '.captcha_verify_img_slide_src',
+        '.captcha_verify_img_slide img',
+        '[class*="img_slide"] img',
+        '[class*="slide_img"] img',
+        '[class*="block"] img[src*="data:image"]',
+      ];
+      for (const sel of selectors) {
+        const el = document.querySelector(sel);
+        if (el && el.src && el.src.startsWith('data:image')) {
+          return { src: el.src, width: el.naturalWidth, height: el.naturalHeight };
         }
       }
-    } catch (_) { /* 忽略单个选择器失败 */ }
+      return null;
+    });
+
+    if (tileData && tileData.src) {
+      const base64Data = tileData.src.replace(/^data:image\/\w+;base64,/, '');
+      result.tile = Buffer.from(base64Data, 'base64');
+      console.log(`✅ DOM 提取拼图块: ${tileData.width}x${tileData.height}`);
+    }
+  } catch (_) { /* ignore */ }
+
+  // 策略 2: 通过 DOM 获取背景图
+  try {
+    const bgData = await page.evaluate(() => {
+      const selectors = [
+        '.captcha_verify_img_src',
+        '.captcha_verify_img img',
+        '[class*="verify_img"] img',
+        '[class*="verify-bg"] img',
+      ];
+      for (const sel of selectors) {
+        const el = document.querySelector(sel);
+        if (el && el.src) {
+          return { src: el.src, width: el.naturalWidth, height: el.naturalHeight };
+        }
+      }
+      return null;
+    });
+
+    if (bgData && bgData.src) {
+      // 可能是 data URL 或者 http URL
+      if (bgData.src.startsWith('data:')) {
+        const base64Data = bgData.src.replace(/^data:image\/\w+;base64,/, '');
+        result.background = Buffer.from(base64Data, 'base64');
+      } else {
+        // http URL — 用 fetch 下载（在 evaluate 中不可行，走 page.goto 太慢）
+        // 暂时不支持，走回截图方式
+        console.log('ℹ️ 背景图是 http URL，走截图方式');
+      }
+      console.log(`✅ DOM 提取背景图: ${bgData.width}x${bgData.height}`);
+    }
+  } catch (_) { /* ignore */ }
+
+  // 策略 3: 截图方式（兜底）
+  if (!result.tile) {
+    console.log('🔍 截图方式提取拼图块...');
+    try {
+      const tileSelectors = [
+        'div[class*="block"] img',
+        'div[class*="tile"] img',
+        'div[class*="puzzle"] img',
+        'div[class*="slice"] img',
+        'div[class*="graph"] img',
+      ];
+      for (const selector of tileSelectors) {
+        const el = page.locator(selector).filter({ visible: true }).first();
+        if (await el.count() > 0) {
+          const box = await el.boundingBox();
+          if (box && box.width > 10 && box.height > 10) {
+            result.tile = await page.screenshot({ clip: { x: box.x, y: box.y, width: box.width, height: box.height } });
+            console.log(`✅ 截图提取拼图块: ${selector} (${box.width.toFixed(0)}x${box.height.toFixed(0)})`);
+            break;
+          }
+        }
+      }
+    } catch (_) { /* ignore */ }
   }
 
-  return null;
+  return result;
 }
 
 /**
@@ -860,20 +926,17 @@ async function findSliderHandle(page) {
     }
   }
 
-  // 策略 4: 尺寸启发式（找 20-80px 的可见方形元素）
-  console.log('🔍 使用尺寸特征查找滑块...');
-  const candidates = page.locator('div, span, a, i, em').filter({ visible: true });
-  const count = await candidates.count();
-  for (let i = 0; i < Math.min(count, 40); i++) {
-    const el = candidates.nth(i);
-    const box = await el.boundingBox().catch(() => null);
-    if (box && box.width > 20 && box.width < 80 && box.height > 20 && box.height < 80) {
-      const ratio = box.width / box.height;
-      if (ratio > 0.5 && ratio < 2.0) {
-        console.log(`✅ 通过尺寸特征找到滑块 (${box.width.toFixed(0)}x${box.height.toFixed(0)})`);
-        return el;
+  // 策略 5: 在 iframe 中查找
+  const frames = page.frames();
+  for (const frame of frames) {
+    if (frame === page.mainFrame()) continue;
+    try {
+      const frameSlider = frame.locator('div[class*="slider"], div[class*="handler"], div[class*="block"], .geetest, .captcha-slider').filter({ visible: true });
+      if (await frameSlider.count() > 0) {
+        console.log(`✅ 在 iframe 中找到滑块`);
+        return frameSlider.first();
       }
-    }
+    } catch (_) { /* frame might be cross-origin, skip */ }
   }
 
   return null;
@@ -932,26 +995,25 @@ async function handleSliderCaptcha(page) {
     }
     console.log(`🖼️ 容器: x=${containerBox.x.toFixed(0)} y=${containerBox.y.toFixed(0)} w=${containerBox.width.toFixed(0)} h=${containerBox.height.toFixed(0)}`);
 
-    // === 3. 截图 + 检测缺口 ===
+    // === 3. 从 DOM 提取图片 + 截图检测缺口 ===
+    // 先尝试从 DOM 拿拼图块和背景的原图（不含覆盖层，精度最高）
+    const captchaImages = await extractCaptchaImages(page);
+
+    // 截图容器（用于边缘检测，或当 DOM 提取失败时作为模板匹配的源）
     const masterShot = await page.screenshot({
       clip: { x: containerBox.x, y: containerBox.y, width: containerBox.width, height: containerBox.height },
     });
 
-    let tileShot = null;
-    try { tileShot = await extractTileImage(page); } catch (_) { /* ignore */ }
+    // 优先用 DOM 提取的背景图（无拼图块覆盖，缺口阴影更清晰）
+    const bgForDetection = captchaImages.background || masterShot;
 
-    const { gapX, method } = await detectGap(masterShot, handleBox.width, tileShot);
+    const { gapX, method } = await detectGap(bgForDetection, handleBox.width, captchaImages.tile);
 
     // === 4. 计算基准滑动距离 ===
     // gapX 是缺口左边缘（容器内坐标）
-    // 滑块中心需要在容器内坐标下计算，然后算出滑块需要移动的距离
-    // 注意：performSlide 的起点是 handleBox.x + handleBox.width/2 (页面坐标)
-    //       而 gapX 是容器内坐标，所以：
-    //       slideDistance = (containerBox.x + gapX + 滑块半宽) - (handleBox.x + 滑块半宽)
-    //                      = containerBox.x + gapX - handleBox.x
-    //  简化：缺口中心页面坐标 = containerBox.x + gapX + sliderWidth/2
-    //        滑块中心页面坐标 = handleBox.x + sliderWidth/2
-    //        移动距离 = 缺口中心 - 滑块中心 = containerBox.x + gapX - handleBox.x
+    // 滑动距离 = 缺口左边缘（页面坐标） - 滑块左边缘（页面坐标）
+    //          = (containerBox.x + gapX) - handleBox.x
+    // 这样滑块左边缘对齐缺口左边缘，配合偏移量搜索覆盖正确位置
     const baseDist = containerBox.x + gapX - handleBox.x;
     const maxDist = containerBox.width - handleBox.width - 10;
 
@@ -969,10 +1031,22 @@ async function handleSliderCaptcha(page) {
     for (const offset of offsets) {
       if (Math.abs(offset) > maxOffset) continue;
 
-      const dist = clamp(baseDist + offset);
+      // 每次尝试前重新获取滑块位置（可能在上一轮失败后自动复位了）
+      const freshHandle = sliderHandle;  // 同一个 locator 引用
+      const freshBox = await freshHandle.boundingBox().catch(() => null);
+      const useBox = freshBox || handleBox;
+
+      // 用最新位置重新计算距离
+      let dist;
+      if (freshBox) {
+        dist = clamp(containerBox.x + gapX - freshBox.x + offset);
+      } else {
+        dist = clamp(baseDist + offset);
+      }
+
       console.log(`🔄 尝试 offset=${offset >= 0 ? '+' : ''}${offset}px → 滑动距离=${dist.toFixed(0)}px`);
 
-      const ok = await performSlide(page, handleBox, dist);
+      const ok = await performSlide(page, useBox, dist);
       if (ok) {
         console.log(`✅ offset=${offset}px 命中！`);
         return true;
@@ -982,7 +1056,35 @@ async function handleSliderCaptcha(page) {
       await page.waitForTimeout(600 + Math.random() * 400);
     }
 
-    console.log('❌ 所有偏移尝试均失败');
+    console.log('❌ 所有缺口偏移尝试均失败');
+
+    // === 6. 终极降级：纯滑块模式（拖到最右端） ===
+    // 很多简单滑块验证码只需要拖到右侧特定位置，不需要拼图
+    const rightDistances = [0.75, 0.80, 0.85, 0.90, 0.93, 0.96];
+    console.log('🔄 尝试纯滑块模式（拖到右端）...');
+    for (const ratio of rightDistances) {
+      // 重新获取滑块当前位置
+      const freshBox = await sliderHandle.boundingBox().catch(() => null);
+      const useBox = freshBox || handleBox;
+      const dist = clamp(Math.floor(containerBox.width * ratio));
+      console.log(`🔄 纯滑块 ${(ratio * 100).toFixed(0)}%: 距离=${dist}px`);
+      const ok = await performSlide(page, useBox, dist);
+      if (ok) {
+        console.log(`✅ 纯滑块 ${(ratio * 100).toFixed(0)}% 命中！`);
+        return true;
+      }
+      await page.waitForTimeout(600 + Math.random() * 400);
+    }
+
+    console.log('❌ 所有尝试均失败');
+
+    // 保存调试截图
+    try {
+      const debugPath = path.join(SCREENSHOT_DIR, `debug_captcha_fail_${Date.now()}.png`);
+      await page.screenshot({ path: debugPath, fullPage: false });
+      console.log(`📸 已保存失败调试截图: ${debugPath}`);
+    } catch (_) { /* ignore */ }
+
     return false;
 
   } catch (error) {
